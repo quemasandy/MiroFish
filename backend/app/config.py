@@ -32,8 +32,10 @@ class Config:
     LLM_BASE_URL = os.environ.get('LLM_BASE_URL', 'https://api.openai.com/v1')
     LLM_MODEL_NAME = os.environ.get('LLM_MODEL_NAME', 'gpt-4o-mini')
     
-    # Zep配置
-    ZEP_API_KEY = os.environ.get('ZEP_API_KEY')
+    # Neo4j配置（本地图数据库）
+    NEO4J_URI = os.environ.get('NEO4J_URI', 'bolt://localhost:7687')
+    NEO4J_USER = os.environ.get('NEO4J_USER', 'neo4j')
+    NEO4J_PASSWORD = os.environ.get('NEO4J_PASSWORD')  # Required - no default for security
     
     # 文件上传配置
     MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB
@@ -62,6 +64,26 @@ class Config:
     REPORT_AGENT_MAX_TOOL_CALLS = int(os.environ.get('REPORT_AGENT_MAX_TOOL_CALLS', '5'))
     REPORT_AGENT_MAX_REFLECTION_ROUNDS = int(os.environ.get('REPORT_AGENT_MAX_REFLECTION_ROUNDS', '2'))
     REPORT_AGENT_TEMPERATURE = float(os.environ.get('REPORT_AGENT_TEMPERATURE', '0.5'))
+
+    # Timeout配置 - 防止网络请求无限挂起
+    # LLM API超时（秒）
+    LLM_TIMEOUT_CONNECT = int(os.environ.get('LLM_TIMEOUT_CONNECT', '30'))
+    LLM_TIMEOUT_READ = int(os.environ.get('LLM_TIMEOUT_READ', '120'))
+    LLM_TIMEOUT_WRITE = int(os.environ.get('LLM_TIMEOUT_WRITE', '30'))
+    LLM_TIMEOUT_POOL = int(os.environ.get('LLM_TIMEOUT_POOL', '10'))
+    LLM_MAX_RETRIES = int(os.environ.get('LLM_MAX_RETRIES', '3'))
+
+    # OASIS模拟env.step()超时（秒）
+    OASIS_ENV_STEP_TIMEOUT = int(os.environ.get('OASIS_ENV_STEP_TIMEOUT', '300'))
+    OASIS_ENV_STEP_MAX_RETRIES = int(os.environ.get('OASIS_ENV_STEP_MAX_RETRIES', '3'))
+
+    # Neo4j连接超时（秒）
+    NEO4J_CONNECTION_TIMEOUT = int(os.environ.get('NEO4J_CONNECTION_TIMEOUT', '30'))
+    NEO4J_MAX_CONNECTION_LIFETIME = int(os.environ.get('NEO4J_MAX_CONNECTION_LIFETIME', '3600'))
+    NEO4J_CONNECTION_ACQUISITION_TIMEOUT = int(os.environ.get('NEO4J_CONNECTION_ACQUISITION_TIMEOUT', '60'))
+
+    # Hugging Face下载超时（秒）
+    HF_HUB_DOWNLOAD_TIMEOUT = int(os.environ.get('HF_HUB_DOWNLOAD_TIMEOUT', '120'))
     
     @classmethod
     def validate(cls):
@@ -69,7 +91,9 @@ class Config:
         errors = []
         if not cls.LLM_API_KEY:
             errors.append("LLM_API_KEY 未配置")
-        if not cls.ZEP_API_KEY:
-            errors.append("ZEP_API_KEY 未配置")
+        if not cls.NEO4J_URI:
+            errors.append("NEO4J_URI 未配置")
+        if not cls.NEO4J_PASSWORD:
+            errors.append("NEO4J_PASSWORD 未配置")
         return errors
 

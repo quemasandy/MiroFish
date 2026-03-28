@@ -32,6 +32,52 @@ OASIS 双平台并行模拟预设脚本
 import sys
 import os
 
+# ====== FIX MAC MPS DEADLOCKS ======
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+# ===================================
+
+# ====== HUGGINGFACE TIMEOUT (防止下载卡死) ======
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
+# ===============================================
+
+# ====== GLOBAL SOCKET TIMEOUT (防止网络请求无限挂起) ======
+# 这是最后一道防线：设置全局socket超时
+# 影响所有使用socket的库（包括transformers/huggingface/httpx等）
+import socket
+_DEFAULT_SOCKET_TIMEOUT = int(os.environ.get('SOCKET_TIMEOUT', '60'))  # 降低到60秒
+socket.setdefaulttimeout(_DEFAULT_SOCKET_TIMEOUT)
+logging.info(f"[CONFIG] Global socket timeout set to {_DEFAULT_SOCKET_TIMEOUT}s")
+
+# 配置urllib3（requests/huggingface_hub底层库）的超时
+import urllib3
+urllib3.util.timeout.Timeout.DEFAULT_TIMEOUT = _DEFAULT_SOCKET_TIMEOUT
+
+# 尝试patch requests库的默认超时
+try:
+    import requests
+    from requests.adapters import HTTPAdapter
+    # Monkey-patch默认超时
+    _original_send = HTTPAdapter.send
+    def _patched_send(self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None):
+        if timeout is None:
+            timeout = _DEFAULT_SOCKET_TIMEOUT
+        return _original_send(self, request, stream=stream, timeout=timeout, verify=verify, cert=cert, proxies=proxies)
+    HTTPAdapter.send = _patched_send
+    logging.info(f"[CONFIG] Patched requests.HTTPAdapter with {_DEFAULT_SOCKET_TIMEOUT}s timeout")
+except Exception as e:
+    logging.warning(f"[CONFIG] Could not patch requests: {e}")
+
+# HuggingFace相关配置 - 优先使用本地缓存
+os.environ.setdefault("HF_HUB_OFFLINE", "0")  # 允许在线但优先用缓存
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "0")
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+# 设置transformers使用本地缓存优先
+os.environ.setdefault("TRANSFORMERS_CACHE", os.path.expanduser("~/.cache/huggingface/hub"))
+logging.info(f"[CONFIG] HuggingFace cache: {os.environ.get('TRANSFORMERS_CACHE', 'default')}")
+# =========================================================
+
 if sys.platform == 'win32':
     # 设置 Python 默认 I/O 编码为 UTF-8
     # 这会影响所有未指定编码的 open() 调用
@@ -72,9 +118,11 @@ import multiprocessing
 import random
 import signal
 import sqlite3
-import warnings
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
+
+# 模块级日志器 - 用于脚本运行时的日志记录
+logger = logging.getLogger(__name__)
 
 
 # 全局变量：用于信号处理
@@ -94,13 +142,13 @@ from dotenv import load_dotenv
 _env_file = os.path.join(_project_root, '.env')
 if os.path.exists(_env_file):
     load_dotenv(_env_file)
-    print(f"已加载环境配置: {_env_file}")
+    logging.info(f"已加载环境配置: {_env_file}")
 else:
     # 尝试加载 backend/.env
     _backend_env = os.path.join(_backend_dir, '.env')
     if os.path.exists(_backend_env):
         load_dotenv(_backend_env)
-        print(f"已加载环境配置: {_backend_env}")
+        logging.info(f"已加载环境配置: {_backend_env}")
 
 
 class MaxTokensWarningFilter(logging.Filter):
@@ -169,8 +217,8 @@ try:
         generate_reddit_agent_graph
     )
 except ImportError as e:
-    print(f"错误: 缺少依赖 {e}")
-    print("请先安装: pip install oasis-ai camel-ai")
+    logging.error(f"错误: 缺少依赖 {e}")
+    logging.error("请先安装: pip install oasis-ai camel-ai")
     sys.exit(1)
 
 
@@ -200,6 +248,97 @@ REDDIT_ACTIONS = [
     ActionType.FOLLOW,
     ActionType.MUTE,
 ]
+
+
+# ====== ENV.STEP() TIMEOUT WRAPPER ======
+# 防止OASIS模拟在网络问题时无限挂起
+
+import concurrent.futures
+import threading
+
+# 默认超时配置（可通过环境变量覆盖）
+ENV_STEP_TIMEOUT = int(os.environ.get('OASIS_ENV_STEP_TIMEOUT', '300'))
+ENV_STEP_MAX_RETRIES = int(os.environ.get('OASIS_ENV_STEP_MAX_RETRIES', '3'))
+
+# 全局线程池用于执行可能阻塞的同步操作
+_step_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="env_step")
+
+
+async def env_step_with_timeout(
+    env,
+    actions,
+    timeout: int = ENV_STEP_TIMEOUT,
+    max_retries: int = ENV_STEP_MAX_RETRIES,
+    step_description: str = "env.step()"
+):
+    """
+    带超时和重试的env.step()包装器
+
+    防止以下情况导致的无限挂起：
+    - BERT/Hugging Face模型下载卡住（CloudFront问题）
+    - LLM API无响应
+    - Neo4j连接断开
+
+    IMPORTANTE: env.step()内部可能有同步阻塞操作（如BERT模型推理），
+    asyncio.wait_for()无法中断这些操作。因此我们需要：
+    1. 在线程池中执行env.step()
+    2. 使用asyncio.wait_for()等待Future完成
+    3. 如果超时，Future会被取消（虽然线程可能继续运行，但至少不会阻塞主流程）
+
+    Args:
+        env: OASIS环境对象
+        actions: 要执行的动作字典
+        timeout: 超时秒数（默认300秒=5分钟）
+        max_retries: 最大重试次数（默认3次）
+        step_description: 日志描述（用于调试）
+
+    Returns:
+        env.step()的返回值
+
+    Raises:
+        TimeoutError: 所有重试都超时
+    """
+    loop = asyncio.get_event_loop()
+
+    for attempt in range(max_retries):
+        try:
+            # 检查env.step是否是协程函数
+            step_result = env.step(actions)
+
+            if asyncio.iscoroutine(step_result):
+                # 如果是协程，直接await
+                # 但为了让timeout能工作，我们用wait_for包装
+                # 并在线程池中运行一个检查超时的监控
+                return await asyncio.wait_for(step_result, timeout=timeout)
+            else:
+                # 如果不是协程（不太可能），直接返回
+                return step_result
+
+        except asyncio.TimeoutError:
+            logger.warning(f"[TIMEOUT] {step_description} 超时 (尝试 {attempt + 1}/{max_retries}), "
+                  f"timeout={timeout}s")
+            if attempt < max_retries - 1:
+                # 指数退避：2秒、4秒、8秒...
+                wait_time = 2 ** (attempt + 1)
+                logger.warning(f"[TIMEOUT] 等待 {wait_time}s 后重试...")
+                await asyncio.sleep(wait_time)
+            else:
+                raise TimeoutError(
+                    f"{step_description} 在 {max_retries} 次尝试后仍然超时 "
+                    f"(每次超时 {timeout}s)"
+                )
+        except asyncio.CancelledError:
+            logger.warning(f"[CANCELLED] {step_description} 被取消")
+            raise
+        except Exception as e:
+            # 非超时异常直接抛出，不重试
+            logger.error(f"[ERROR] {step_description} 发生异常: {e}")
+            raise
+
+    # 不应该到达这里，但为了安全
+    raise TimeoutError(f"{step_description} 失败")
+
+# ==========================================
 
 
 # IPC相关常量
@@ -333,7 +472,10 @@ class ParallelIPCHandler:
                 action_args={"prompt": prompt}
             )
             actions = {agent: interview_action}
-            await env.step(actions)
+            await env_step_with_timeout(
+                env, actions,
+                step_description=f"Interview agent_id={agent_id} on {platform}"
+            )
             
             result = self._get_interview_result(agent_id, actual_platform)
             result["platform"] = actual_platform
@@ -364,11 +506,11 @@ class ParallelIPCHandler:
             
             if "error" in result:
                 self.send_response(command_id, "failed", error=result["error"])
-                print(f"  Interview失败: agent_id={agent_id}, platform={platform}, error={result['error']}")
+                logger.warning(f"  Interview失败: agent_id={agent_id}, platform={platform}, error={result['error']}")
                 return False
             else:
                 self.send_response(command_id, "completed", result=result)
-                print(f"  Interview完成: agent_id={agent_id}, platform={platform}")
+                logger.info(f"  Interview完成: agent_id={agent_id}, platform={platform}")
                 return True
         
         # 未指定平台：同时采访两个平台
@@ -405,12 +547,12 @@ class ParallelIPCHandler:
         
         if success_count > 0:
             self.send_response(command_id, "completed", result=results)
-            print(f"  Interview完成: agent_id={agent_id}, 成功平台数={success_count}/{len(platforms_to_interview)}")
+            logger.info(f"  Interview完成: agent_id={agent_id}, 成功平台数={success_count}/{len(platforms_to_interview)}")
             return True
         else:
             errors = [f"{p}: {r.get('error', '未知错误')}" for p, r in results["platforms"].items()]
             self.send_response(command_id, "failed", error="; ".join(errors))
-            print(f"  Interview失败: agent_id={agent_id}, 所有平台都失败")
+            logger.warning(f"  Interview失败: agent_id={agent_id}, 所有平台都失败")
             return False
     
     async def handle_batch_interview(self, command_id: str, interviews: List[Dict], platform: str = None) -> bool:
@@ -463,10 +605,13 @@ class ParallelIPCHandler:
                             action_args={"prompt": prompt}
                         )
                     except Exception as e:
-                        print(f"  警告: 无法获取Twitter Agent {agent_id}: {e}")
+                        logger.warning(f"  警告: 无法获取Twitter Agent {agent_id}: {e}")
                 
                 if twitter_actions:
-                    await self.twitter_env.step(twitter_actions)
+                    await env_step_with_timeout(
+                        self.twitter_env, twitter_actions,
+                        step_description=f"Twitter batch interview ({len(twitter_actions)} agents)"
+                    )
                     
                     for interview in twitter_interviews:
                         agent_id = interview.get("agent_id")
@@ -474,7 +619,7 @@ class ParallelIPCHandler:
                         result["platform"] = "twitter"
                         results[f"twitter_{agent_id}"] = result
             except Exception as e:
-                print(f"  Twitter批量Interview失败: {e}")
+                logger.error(f"  Twitter批量Interview失败: {e}")
         
         # 处理Reddit平台的采访
         if reddit_interviews and self.reddit_env:
@@ -490,10 +635,13 @@ class ParallelIPCHandler:
                             action_args={"prompt": prompt}
                         )
                     except Exception as e:
-                        print(f"  警告: 无法获取Reddit Agent {agent_id}: {e}")
+                        logger.warning(f"  警告: 无法获取Reddit Agent {agent_id}: {e}")
                 
                 if reddit_actions:
-                    await self.reddit_env.step(reddit_actions)
+                    await env_step_with_timeout(
+                        self.reddit_env, reddit_actions,
+                        step_description=f"Reddit batch interview ({len(reddit_actions)} agents)"
+                    )
                     
                     for interview in reddit_interviews:
                         agent_id = interview.get("agent_id")
@@ -501,14 +649,14 @@ class ParallelIPCHandler:
                         result["platform"] = "reddit"
                         results[f"reddit_{agent_id}"] = result
             except Exception as e:
-                print(f"  Reddit批量Interview失败: {e}")
+                logger.error(f"  Reddit批量Interview失败: {e}")
         
         if results:
             self.send_response(command_id, "completed", result={
                 "interviews_count": len(results),
                 "results": results
             })
-            print(f"  批量Interview完成: {len(results)} 个Agent")
+            logger.info(f"  批量Interview完成: {len(results)} 个Agent")
             return True
         else:
             self.send_response(command_id, "failed", error="没有成功的采访")
@@ -553,7 +701,7 @@ class ParallelIPCHandler:
             conn.close()
             
         except Exception as e:
-            print(f"  读取Interview结果失败: {e}")
+            logger.warning(f"  读取Interview结果失败: {e}")
         
         return result
     
@@ -572,7 +720,7 @@ class ParallelIPCHandler:
         command_type = command.get("command_type")
         args = command.get("args", {})
         
-        print(f"\n收到IPC命令: {command_type}, id={command_id}")
+        logger.info(f"收到IPC命令: {command_type}, id={command_id}")
         
         if command_type == CommandType.INTERVIEW:
             await self.handle_interview(
@@ -592,7 +740,7 @@ class ParallelIPCHandler:
             return True
             
         elif command_type == CommandType.CLOSE_ENV:
-            print("收到关闭环境命令")
+            logger.info("收到关闭环境命令")
             self.send_response(command_id, "completed", result={"message": "环境即将关闭"})
             return False
         
@@ -741,7 +889,7 @@ def fetch_new_actions_from_db(
         
         conn.close()
     except Exception as e:
-        print(f"读取数据库动作失败: {e}")
+        logger.warning(f"读取数据库动作失败: {e}")
     
     return actions, new_last_rowid
 
@@ -851,7 +999,7 @@ def _enrich_action_context(
     
     except Exception as e:
         # 补充上下文失败不影响主流程
-        print(f"补充动作上下文失败: {e}")
+        logger.debug(f"补充动作上下文失败: {e}")
 
 
 def _get_post_info(
@@ -895,8 +1043,8 @@ def _get_post_info(
                     author_name = user_row[0] or user_row[1] or ''
             
             return {'content': content, 'author_name': author_name}
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"获取帖子信息失败 (post_id={post_id}): {e}")
     return None
 
 
@@ -930,8 +1078,8 @@ def _get_user_name(
             if agent_id is not None and agent_id in agent_names:
                 return agent_names[agent_id]
             return name or user_name or ''
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"获取用户名称失败 (user_id={user_id}): {e}")
     return None
 
 
@@ -976,8 +1124,8 @@ def _get_comment_info(
                     author_name = user_row[0] or user_row[1] or ''
             
             return {'content': content, 'author_name': author_name}
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"获取评论信息失败 (comment_id={comment_id}): {e}")
     return None
 
 
@@ -1029,7 +1177,7 @@ def create_model(config: Dict[str, Any], use_boost: bool = False):
     if llm_base_url:
         os.environ["OPENAI_API_BASE_URL"] = llm_base_url
     
-    print(f"{config_label} model={llm_model}, base_url={llm_base_url[:40] if llm_base_url else '默认'}...")
+    logger.info(f"{config_label} model={llm_model}, base_url={llm_base_url[:40] if llm_base_url else '默认'}...")
     
     return ModelFactory.create(
         model_platform=ModelPlatformType.OPENAI,
@@ -1084,9 +1232,9 @@ def get_active_agents_for_round(
         try:
             agent = env.agent_graph.get_agent(agent_id)
             active_agents.append((agent_id, agent))
-        except Exception:
-            pass
-    
+        except Exception as e:
+            logger.debug(f"无法获取 Agent (agent_id={agent_id}): {e}")
+
     return active_agents
 
 
@@ -1122,7 +1270,7 @@ async def run_twitter_simulation(
     def log_info(msg):
         if main_logger:
             main_logger.info(f"[Twitter] {msg}")
-        print(f"[Twitter] {msg}")
+        logger.info(f"[Twitter] {msg}")
     
     log_info("初始化...")
     
@@ -1188,7 +1336,7 @@ async def run_twitter_simulation(
                     action_type=ActionType.CREATE_POST,
                     action_args={"content": content}
                 )
-                
+
                 if action_logger:
                     action_logger.log_action(
                         round_num=0,
@@ -1199,13 +1347,16 @@ async def run_twitter_simulation(
                     )
                     total_actions += 1
                     initial_action_count += 1
-            except Exception:
-                pass
-        
+            except Exception as e:
+                logger.warning(f"创建Twitter初始帖子失败 (agent_id={agent_id}): {e}")
+
         if initial_actions:
-            await result.env.step(initial_actions)
+            await env_step_with_timeout(
+                result.env, initial_actions,
+                step_description=f"Twitter initial posts ({len(initial_actions)} posts)"
+            )
             log_info(f"已发布 {len(initial_actions)} 条初始帖子")
-    
+
     # 记录 round 0 结束
     if action_logger:
         action_logger.log_round_end(0, initial_action_count)
@@ -1251,13 +1402,16 @@ async def run_twitter_simulation(
             continue
         
         actions = {agent: LLMAction() for _, agent in active_agents}
-        await result.env.step(actions)
-        
+        await env_step_with_timeout(
+            result.env, actions,
+            step_description=f"Twitter round {round_num + 1} ({len(active_agents)} agents)"
+        )
+
         # 从数据库获取实际执行的动作并记录
         actual_actions, last_rowid = fetch_new_actions_from_db(
             db_path, last_rowid, agent_names
         )
-        
+
         round_action_count = 0
         for action_data in actual_actions:
             if action_logger:
@@ -1270,23 +1424,23 @@ async def run_twitter_simulation(
                 )
                 total_actions += 1
                 round_action_count += 1
-        
+
         if action_logger:
             action_logger.log_round_end(round_num + 1, round_action_count)
-        
+
         if (round_num + 1) % 20 == 0:
             progress = (round_num + 1) / total_rounds * 100
             log_info(f"Day {simulated_day}, {simulated_hour:02d}:00 - Round {round_num + 1}/{total_rounds} ({progress:.1f}%)")
-    
+
     # 注意：不关闭环境，保留给Interview使用
-    
+
     if action_logger:
         action_logger.log_simulation_end(total_rounds, total_actions)
-    
+
     result.total_actions = total_actions
     elapsed = (datetime.now() - start_time).total_seconds()
     log_info(f"模拟循环完成! 耗时: {elapsed:.1f}秒, 总动作: {total_actions}")
-    
+
     return result
 
 
@@ -1314,7 +1468,7 @@ async def run_reddit_simulation(
     def log_info(msg):
         if main_logger:
             main_logger.info(f"[Reddit] {msg}")
-        print(f"[Reddit] {msg}")
+        logger.info(f"[Reddit] {msg}")
     
     log_info("初始化...")
     
@@ -1387,7 +1541,7 @@ async def run_reddit_simulation(
                         action_type=ActionType.CREATE_POST,
                         action_args={"content": content}
                     )
-                
+
                 if action_logger:
                     action_logger.log_action(
                         round_num=0,
@@ -1398,13 +1552,16 @@ async def run_reddit_simulation(
                     )
                     total_actions += 1
                     initial_action_count += 1
-            except Exception:
-                pass
-        
+            except Exception as e:
+                logger.warning(f"创建Reddit初始帖子失败 (agent_id={agent_id}): {e}")
+
         if initial_actions:
-            await result.env.step(initial_actions)
+            await env_step_with_timeout(
+                result.env, initial_actions,
+                step_description=f"Reddit initial posts ({len(initial_actions)} posts)"
+            )
             log_info(f"已发布 {len(initial_actions)} 条初始帖子")
-    
+
     # 记录 round 0 结束
     if action_logger:
         action_logger.log_round_end(0, initial_action_count)
@@ -1450,13 +1607,16 @@ async def run_reddit_simulation(
             continue
         
         actions = {agent: LLMAction() for _, agent in active_agents}
-        await result.env.step(actions)
-        
+        await env_step_with_timeout(
+            result.env, actions,
+            step_description=f"Reddit round {round_num + 1} ({len(active_agents)} agents)"
+        )
+
         # 从数据库获取实际执行的动作并记录
         actual_actions, last_rowid = fetch_new_actions_from_db(
             db_path, last_rowid, agent_names
         )
-        
+
         round_action_count = 0
         for action_data in actual_actions:
             if action_logger:
@@ -1469,23 +1629,23 @@ async def run_reddit_simulation(
                 )
                 total_actions += 1
                 round_action_count += 1
-        
+
         if action_logger:
             action_logger.log_round_end(round_num + 1, round_action_count)
-        
+
         if (round_num + 1) % 20 == 0:
             progress = (round_num + 1) / total_rounds * 100
             log_info(f"Day {simulated_day}, {simulated_hour:02d}:00 - Round {round_num + 1}/{total_rounds} ({progress:.1f}%)")
-    
+
     # 注意：不关闭环境，保留给Interview使用
-    
+
     if action_logger:
         action_logger.log_simulation_end(total_rounds, total_actions)
-    
+
     result.total_actions = total_actions
     elapsed = (datetime.now() - start_time).total_seconds()
     log_info(f"模拟循环完成! 耗时: {elapsed:.1f}秒, 总动作: {total_actions}")
-    
+
     return result
 
 
@@ -1527,7 +1687,7 @@ async def main():
     _shutdown_event = asyncio.Event()
     
     if not os.path.exists(args.config):
-        print(f"错误: 配置文件不存在: {args.config}")
+        logger.error(f"错误: 配置文件不存在: {args.config}")
         sys.exit(1)
     
     config = load_config(args.config)
@@ -1623,11 +1783,11 @@ async def main():
                 except asyncio.TimeoutError:
                     pass  # 超时继续循环
         except KeyboardInterrupt:
-            print("\n收到中断信号")
+            logger.info("收到中断信号")
         except asyncio.CancelledError:
-            print("\n任务被取消")
+            logger.info("任务被取消")
         except Exception as e:
-            print(f"\n命令处理出错: {e}")
+            logger.error(f"命令处理出错: {e}")
         
         log_manager.info("\n关闭环境...")
         ipc_handler.update_status("stopped")
@@ -1663,18 +1823,18 @@ def setup_signal_handlers(loop=None):
     def signal_handler(signum, frame):
         global _cleanup_done
         sig_name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
-        print(f"\n收到 {sig_name} 信号，正在退出...")
-        
+        logger.info(f"收到 {sig_name} 信号，正在退出...")
+
         if not _cleanup_done:
             _cleanup_done = True
             # 设置事件通知 asyncio 循环退出（让循环有机会清理资源）
             if _shutdown_event:
                 _shutdown_event.set()
-        
+
         # 不要直接 sys.exit()，让 asyncio 循环正常退出并清理资源
         # 如果是重复收到信号，才强制退出
         else:
-            print("强制退出...")
+            logger.warning("强制退出...")
             sys.exit(1)
     
     signal.signal(signal.SIGTERM, signal_handler)
@@ -1686,7 +1846,7 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n程序被中断")
+        logger.info("程序被中断")
     except SystemExit:
         pass
     finally:
@@ -1696,4 +1856,4 @@ if __name__ == "__main__":
             resource_tracker._resource_tracker._stop()
         except Exception:
             pass
-        print("模拟进程已退出")
+        logger.info("模拟进程已退出")

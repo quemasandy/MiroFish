@@ -6,6 +6,8 @@ LLM客户端封装
 import json
 import re
 from typing import Optional, Dict, Any, List
+
+import httpx
 from openai import OpenAI
 
 from ..config import Config
@@ -29,7 +31,14 @@ class LLMClient:
         
         self.client = OpenAI(
             api_key=self.api_key,
-            base_url=self.base_url
+            base_url=self.base_url,
+            timeout=httpx.Timeout(
+                connect=float(Config.LLM_TIMEOUT_CONNECT),
+                read=float(Config.LLM_TIMEOUT_READ),
+                write=float(Config.LLM_TIMEOUT_WRITE),
+                pool=float(Config.LLM_TIMEOUT_POOL),
+            ),
+            max_retries=Config.LLM_MAX_RETRIES,
         )
     
     def chat(
@@ -55,13 +64,24 @@ class LLMClient:
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": max_tokens,
         }
         
         if response_format:
             kwargs["response_format"] = response_format
+            
+        kwargs["max_completion_tokens"] = max_tokens
         
-        response = self.client.chat.completions.create(**kwargs)
+        try:
+            response = self.client.chat.completions.create(**kwargs)
+        except Exception as e:
+            error_str = str(e).lower()
+            if "max_completion_tokens" in error_str or "max_tokens" in error_str or "unsupported_parameter" in error_str:
+                kwargs.pop("max_completion_tokens", None)
+                kwargs["max_tokens"] = max_tokens
+                response = self.client.chat.completions.create(**kwargs)
+            else:
+                raise e
+            
         content = response.choices[0].message.content
         # 部分模型（如MiniMax M2.5）会在content中包含<think>思考内容，需要移除
         content = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()

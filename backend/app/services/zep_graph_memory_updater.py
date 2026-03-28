@@ -1,6 +1,6 @@
 """
-Zep图谱记忆更新服务
-将模拟中的Agent活动动态更新到Zep图谱中
+图谱记忆更新服务（Neo4j版本）
+将模拟中的Agent活动动态更新到Neo4j图谱中
 """
 
 import os
@@ -12,12 +12,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from queue import Queue, Empty
 
-from zep_cloud.client import Zep
+from neo4j import GraphDatabase
+import uuid as uuid_mod
 
 from ..config import Config
 from ..utils.logger import get_logger
 
-logger = get_logger('mirofish.zep_graph_memory_updater')
+logger = get_logger('mirofish.graph_memory_updater')
 
 
 @dataclass
@@ -233,16 +234,18 @@ class ZepGraphMemoryUpdater:
         初始化更新器
         
         Args:
-            graph_id: Zep图谱ID
-            api_key: Zep API Key（可选，默认从配置读取）
+            graph_id: 图谱ID
+            api_key: 兼容旧接口，已不使用
         """
         self.graph_id = graph_id
-        self.api_key = api_key or Config.ZEP_API_KEY
         
-        if not self.api_key:
-            raise ValueError("ZEP_API_KEY未配置")
-        
-        self.client = Zep(api_key=self.api_key)
+        self.driver = GraphDatabase.driver(
+            Config.NEO4J_URI,
+            auth=(Config.NEO4J_USER, Config.NEO4J_PASSWORD),
+            connection_timeout=Config.NEO4J_CONNECTION_TIMEOUT,
+            max_connection_lifetime=Config.NEO4J_MAX_CONNECTION_LIFETIME,
+            connection_acquisition_timeout=Config.NEO4J_CONNECTION_ACQUISITION_TIMEOUT,
+        )
         
         # 活动队列
         self._activity_queue: Queue = Queue()
@@ -259,13 +262,13 @@ class ZepGraphMemoryUpdater:
         self._worker_thread: Optional[threading.Thread] = None
         
         # 统计
-        self._total_activities = 0  # 实际添加到队列的活动数
-        self._total_sent = 0        # 成功发送到Zep的批次数
-        self._total_items_sent = 0  # 成功发送到Zep的活动条数
-        self._failed_count = 0      # 发送失败的批次数
-        self._skipped_count = 0     # 被过滤跳过的活动数（DO_NOTHING）
+        self._total_activities = 0
+        self._total_sent = 0
+        self._total_items_sent = 0
+        self._failed_count = 0
+        self._skipped_count = 0
         
-        logger.info(f"ZepGraphMemoryUpdater 初始化完成: graph_id={graph_id}, batch_size={self.BATCH_SIZE}")
+        logger.info(f"GraphMemoryUpdater 初始化完成: graph_id={graph_id}, batch_size={self.BATCH_SIZE}")
     
     def _get_platform_display_name(self, platform: str) -> str:
         """获取平台的显示名称"""
@@ -389,7 +392,7 @@ class ZepGraphMemoryUpdater:
     
     def _send_batch_activities(self, activities: List[AgentActivity], platform: str):
         """
-        批量发送活动到Zep图谱（合并为一条文本）
+        批量发送活动到Neo4j图谱
         
         Args:
             activities: Agent活动列表
@@ -398,32 +401,50 @@ class ZepGraphMemoryUpdater:
         if not activities:
             return
         
-        # 将多条活动合并为一条文本，用换行分隔
-        episode_texts = [activity.to_episode_text() for activity in activities]
-        combined_text = "\n".join(episode_texts)
-        
         # 带重试的发送
         for attempt in range(self.MAX_RETRIES):
             try:
-                self.client.graph.add(
-                    graph_id=self.graph_id,
-                    type="text",
-                    data=combined_text
-                )
+                with self.driver.session() as session:
+                    for activity in activities:
+                        episode_text = activity.to_episode_text()
+                        session.run(
+                            """
+                            MERGE (a:Entity {name: $agent_name, graph_id: $graph_id})
+                            ON CREATE SET a.uuid = $uuid, a.summary = '', a.created_at = datetime()
+                            WITH a
+                            CREATE (e:Episode {
+                                uuid: $ep_uuid,
+                                graph_id: $graph_id,
+                                platform: $platform,
+                                action_type: $action_type,
+                                text: $text,
+                                round_num: $round_num,
+                                created_at: datetime()
+                            })
+                            CREATE (a)-[:PERFORMED]->(e)
+                            """,
+                            agent_name=activity.agent_name,
+                            graph_id=self.graph_id,
+                            uuid=str(uuid_mod.uuid4()),
+                            ep_uuid=str(uuid_mod.uuid4()),
+                            platform=platform,
+                            action_type=activity.action_type,
+                            text=episode_text,
+                            round_num=activity.round_num,
+                        )
                 
                 self._total_sent += 1
                 self._total_items_sent += len(activities)
                 display_name = self._get_platform_display_name(platform)
                 logger.info(f"成功批量发送 {len(activities)} 条{display_name}活动到图谱 {self.graph_id}")
-                logger.debug(f"批量内容预览: {combined_text[:200]}...")
                 return
                 
             except Exception as e:
                 if attempt < self.MAX_RETRIES - 1:
-                    logger.warning(f"批量发送到Zep失败 (尝试 {attempt + 1}/{self.MAX_RETRIES}): {e}")
+                    logger.warning(f"批量发送到Neo4j失败 (尝试 {attempt + 1}/{self.MAX_RETRIES}): {e}")
                     time.sleep(self.RETRY_DELAY * (attempt + 1))
                 else:
-                    logger.error(f"批量发送到Zep失败，已重试{self.MAX_RETRIES}次: {e}")
+                    logger.error(f"批量发送到Neo4j失败，已重试{self.MAX_RETRIES}次: {e}")
                     self._failed_count += 1
     
     def _flush_remaining(self):

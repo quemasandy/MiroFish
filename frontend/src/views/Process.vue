@@ -715,10 +715,10 @@ const startGraphPolling = () => {
   // 立即获取一次
   fetchGraphData()
   
-  // 每 10 秒自动获取一次图谱数据
+  // 每 30 秒自动获取一次图谱数据
   graphPollTimer = setInterval(async () => {
     await fetchGraphData()
-  }, 10000)
+  }, 30000)
 }
 
 // 手动刷新图谱
