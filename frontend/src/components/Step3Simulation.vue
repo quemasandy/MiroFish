@@ -289,6 +289,7 @@
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { 
+  getSimulation,
   startSimulation, 
   stopSimulation,
   getRunStatus, 
@@ -377,26 +378,34 @@ const resetAllState = () => {
 }
 
 // 启动模拟
-const doStartSimulation = async () => {
+const doStartSimulation = async (options = {}) => {
   if (!props.simulationId) {
     addLog('错误：缺少 simulationId')
     return
   }
-  
+
+  const simulationState = options.simulationState || null
+
   // 先重置所有状态，确保不会受到上一次模拟的影响
   resetAllState()
-  
+
   isStarting.value = true
   startError.value = null
-  addLog('正在启动双平台并行模拟...')
+
+  const shouldResume = !!simulationState && ['stopped', 'failed'].includes(simulationState.status)
+  addLog(shouldResume ? '检测到历史进度，准备恢复双平台并行模拟...' : '正在启动双平台并行模拟...')
   emit('update-status', 'processing')
   
   try {
     const params = {
       simulation_id: props.simulationId,
       platform: 'parallel',
-      force: true,  // 强制重新开始
       enable_graph_memory_update: true  // 开启动态图谱更新
+    }
+
+    if (shouldResume) {
+      params.resume = true
+      addLog(`恢复基线轮次: ${simulationState.current_round || 0}`)
     }
     
     if (props.maxRounds) {
@@ -409,7 +418,9 @@ const doStartSimulation = async () => {
     const res = await startSimulation(params)
     
     if (res.success && res.data) {
-      if (res.data.force_restarted) {
+      if (res.data.resume_applied) {
+        addLog(`✓ 已从 R${res.data.resume_from_round || 0} 恢复模拟`)
+      } else if (res.data.force_restarted) {
         addLog('✓ 已清理旧的模拟日志，重新开始模拟')
       }
       addLog('✓ 模拟引擎启动成功')
@@ -417,7 +428,10 @@ const doStartSimulation = async () => {
       
       phase.value = 1
       runStatus.value = res.data
+      prevTwitterRound.value = res.data.twitter_current_round || 0
+      prevRedditRound.value = res.data.reddit_current_round || 0
       
+      await fetchRunStatusDetail()
       startStatusPolling()
       startDetailPolling()
     } else {
@@ -431,6 +445,49 @@ const doStartSimulation = async () => {
     emit('update-status', 'error')
   } finally {
     isStarting.value = false
+  }
+}
+
+const bootstrapSimulation = async () => {
+  addLog('Step3 模拟运行初始化')
+  if (!props.simulationId) return
+
+  try {
+    const [simRes, runRes] = await Promise.all([
+      getSimulation(props.simulationId),
+      getRunStatus(props.simulationId)
+    ])
+
+    const simulationState = simRes.success ? simRes.data : null
+    const runnerState = runRes.success ? runRes.data : null
+
+    if (simulationState?.status === 'completed') {
+      addLog('检测到模拟已完成，加载历史结果')
+      phase.value = 2
+      runStatus.value = runnerState || {}
+      prevTwitterRound.value = runnerState?.twitter_current_round || 0
+      prevRedditRound.value = runnerState?.reddit_current_round || 0
+      await fetchRunStatusDetail()
+      emit('update-status', 'completed')
+      return
+    }
+
+    if (runnerState && ['running', 'starting'].includes(runnerState.runner_status)) {
+      addLog('检测到模拟仍在运行，恢复状态轮询')
+      phase.value = 1
+      runStatus.value = runnerState
+      prevTwitterRound.value = runnerState.twitter_current_round || 0
+      prevRedditRound.value = runnerState.reddit_current_round || 0
+      await fetchRunStatusDetail()
+      startStatusPolling()
+      startDetailPolling()
+      return
+    }
+
+    await doStartSimulation({ simulationState })
+  } catch (err) {
+    addLog(`初始化检查失败，转为直接启动: ${err.message}`)
+    await doStartSimulation()
   }
 }
 
@@ -685,9 +742,8 @@ watch(() => props.systemLogs?.length, () => {
 })
 
 onMounted(() => {
-  addLog('Step3 模拟运行初始化')
   if (props.simulationId) {
-    doStartSimulation()
+    bootstrapSimulation()
   }
 })
 

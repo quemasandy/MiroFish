@@ -20,6 +20,7 @@ from openai import OpenAI
 
 from ..config import Config
 from ..utils.logger import get_logger
+from ..utils.llm_routing import resolve_llm_config
 from .zep_entity_reader import EntityNode, EntityReader
 
 logger = get_logger('mirofish.oasis_profile')
@@ -185,9 +186,15 @@ class OasisProfileGenerator:
         zep_api_key: Optional[str] = None,
         graph_id: Optional[str] = None
     ):
-        self.api_key = api_key or Config.LLM_API_KEY
-        self.base_url = base_url or Config.LLM_BASE_URL
-        self.model_name = model_name or Config.LLM_MODEL_NAME
+        self.llm_config = resolve_llm_config(
+            "profile_generation",
+            api_key=api_key,
+            base_url=base_url,
+            model_name=model_name,
+        )
+        self.api_key = self.llm_config.api_key
+        self.base_url = self.llm_config.base_url
+        self.model_name = self.llm_config.model_name
         
         if not self.api_key:
             raise ValueError("LLM_API_KEY 未配置")
@@ -207,6 +214,18 @@ class OasisProfileGenerator:
         # Neo4j客户端用于检索丰富上下文
         self.graph_id = graph_id
         self.entity_reader = EntityReader() if graph_id else None
+
+    def _log_llm_request(self, request_type: str):
+        """Log the resolved model for this stage."""
+        logger.info(
+            "[LLM_ROUTING] stage=%s route=%s profile=%s model=%s base_url=%s request=%s",
+            self.llm_config.stage,
+            self.llm_config.route,
+            self.llm_config.profile,
+            self.llm_config.model_name,
+            self.llm_config.base_url,
+            request_type,
+        )
     
     def generate_profile_from_entity(
         self, 
@@ -453,6 +472,7 @@ class OasisProfileGenerator:
         
         for attempt in range(max_attempts):
             try:
+                self._log_llm_request("chat_json")
                 response = self.client.chat.completions.create(
                     model=self.model_name,
                     messages=[
@@ -1124,4 +1144,3 @@ class OasisProfileGenerator:
         """[已废弃] 请使用 save_profiles() 方法"""
         logger.warning("save_profiles_to_json已废弃，请使用save_profiles方法")
         self.save_profiles(profiles, file_path, platform)
-

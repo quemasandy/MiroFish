@@ -143,10 +143,12 @@ class SimulationIPCClient:
             args=args
         )
         
-        # 写入命令文件
+        # Atomic write: write to temp file then rename to avoid partial reads
         command_file = os.path.join(self.commands_dir, f"{command_id}.json")
-        with open(command_file, 'w', encoding='utf-8') as f:
+        tmp_file = command_file + ".tmp"
+        with open(tmp_file, 'w', encoding='utf-8') as f:
             json.dump(command.to_dict(), f, ensure_ascii=False, indent=2)
+        os.replace(tmp_file, command_file)
         
         logger.info(f"发送IPC命令: {command_type.value}, command_id={command_id}")
         

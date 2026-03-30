@@ -85,6 +85,10 @@
           <span class="header-meta mono" v-if="activeStep.meta">{{ activeStep.meta }}</span>
         </div>
 
+        <div v-if="errorMessage" class="status-message error">
+          {{ errorMessage }}
+        </div>
+
         <!-- Workflow Overview (flat, status-based palette) -->
         <div class="workflow-overview" v-if="agentLogs.length > 0 || reportOutline">
           <div class="workflow-metrics">
@@ -374,13 +378,13 @@
       </div>
     </div>
 
-    <!-- Bottom Console Logs -->
-    <div class="console-logs">
-      <div class="log-header">
-        <span class="log-title">CONSOLE OUTPUT</span>
+    <!-- Bottom Console Logs (collapsible) -->
+    <div class="console-logs" :class="{ collapsed: consoleCollapsed }">
+      <div class="log-header" @click="consoleCollapsed = !consoleCollapsed" style="cursor: pointer;">
+        <span class="log-title">CONSOLE OUTPUT {{ consoleCollapsed ? '▸' : '▾' }}</span>
         <span class="log-id">{{ reportId || 'NO_REPORT' }}</span>
       </div>
-      <div class="log-content" ref="logContent">
+      <div v-show="!consoleCollapsed" class="log-content" ref="logContent">
         <div class="log-line" v-for="(log, idx) in consoleLogs" :key="idx">
           <span class="log-msg" :class="getLogLevelClass(log)">{{ log }}</span>
         </div>
@@ -414,6 +418,7 @@ const goToInteraction = () => {
 // State
 const agentLogs = ref([])
 const consoleLogs = ref([])
+const consoleCollapsed = ref(true)
 const agentLogLine = ref(0)
 const consoleLogLine = ref(0)
 const reportOutline = ref(null)
@@ -423,6 +428,7 @@ const expandedContent = ref(new Set())
 const expandedLogs = ref(new Set())
 const collapsedSections = ref(new Set())
 const isComplete = ref(false)
+const errorMessage = ref('')
 const startTime = ref(null)
 const leftPanel = ref(null)
 const rightPanel = ref(null)
@@ -1702,12 +1708,14 @@ const QuickSearchDisplay = {
 
 // Computed
 const statusClass = computed(() => {
+  if (errorMessage.value) return 'error'
   if (isComplete.value) return 'completed'
   if (agentLogs.value.length > 0) return 'processing'
   return 'pending'
 })
 
 const statusText = computed(() => {
+  if (errorMessage.value) return 'Failed'
   if (isComplete.value) return 'Completed'
   if (agentLogs.value.length > 0) return 'Generating...'
   return 'Waiting'
@@ -2000,7 +2008,8 @@ const getActionLabel = (action) => {
     'tool_call': 'Tool Call',
     'tool_result': 'Tool Result',
     'llm_response': 'LLM Response',
-    'report_complete': 'Complete'
+    'report_complete': 'Complete',
+    'error': 'Error'
   }
   return labels[action] || action
 }
@@ -2053,6 +2062,13 @@ const fetchAgentLog = async () => {
             emit('update-status', 'completed')
             stopPolling()
             // 滚动逻辑统一在循环结束后的 nextTick 中处理
+          }
+
+          if (log.action === 'error') {
+            errorMessage.value = log.details?.error || log.details?.message || 'Report generation failed'
+            currentSectionIndex.value = null
+            emit('update-status', 'error')
+            stopPolling()
           }
           
           if (log.action === 'report_start') {
@@ -2195,6 +2211,7 @@ watch(() => props.reportId, (newId) => {
     expandedLogs.value = new Set()
     collapsedSections.value = new Set()
     isComplete.value = false
+    errorMessage.value = ''
     startTime.value = null
     
     startPolling()
@@ -3074,6 +3091,13 @@ watch(() => props.reportId, (newId) => {
   background: #ECFDF5;
   border-color: #A7F3D0;
   color: #065F46;
+}
+
+.status-message.error {
+  margin: 12px 12px 0;
+  background: #FEF2F2;
+  border-color: #FECACA;
+  color: #991B1B;
 }
 
 .outline-badge {
@@ -5097,7 +5121,7 @@ watch(() => props.reportId, (newId) => {
   border-radius: 4px;
 }
 
-/* Console Logs - 与 Step3Simulation.vue 保持一致 */
+/* Console Logs - collapsible */
 .console-logs {
   background: #000;
   color: #DDD;
@@ -5105,6 +5129,10 @@ watch(() => props.reportId, (newId) => {
   font-family: 'JetBrains Mono', monospace;
   border-top: 1px solid #222;
   flex-shrink: 0;
+}
+
+.console-logs.collapsed {
+  padding: 8px 16px;
 }
 
 .log-header {

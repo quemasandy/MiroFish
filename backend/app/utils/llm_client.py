@@ -11,6 +11,11 @@ import httpx
 from openai import OpenAI
 
 from ..config import Config
+from .logger import get_logger
+from .llm_routing import resolve_llm_config
+
+
+logger = get_logger('mirofish.llm_client')
 
 
 class LLMClient:
@@ -20,11 +25,19 @@ class LLMClient:
         self,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
-        model: Optional[str] = None
+        model: Optional[str] = None,
+        stage: str = "default",
     ):
-        self.api_key = api_key or Config.LLM_API_KEY
-        self.base_url = base_url or Config.LLM_BASE_URL
-        self.model = model or Config.LLM_MODEL_NAME
+        self.stage = stage
+        self.resolved = resolve_llm_config(
+            stage=stage,
+            api_key=api_key,
+            base_url=base_url,
+            model_name=model,
+        )
+        self.api_key = self.resolved.api_key
+        self.base_url = self.resolved.base_url
+        self.model = self.resolved.model_name
         
         if not self.api_key:
             raise ValueError("LLM_API_KEY 未配置")
@@ -39,6 +52,18 @@ class LLMClient:
                 pool=float(Config.LLM_TIMEOUT_POOL),
             ),
             max_retries=Config.LLM_MAX_RETRIES,
+        )
+
+    def _log_request(self, request_type: str):
+        """Log the resolved model for this request."""
+        logger.info(
+            "[LLM_ROUTING] stage=%s route=%s profile=%s model=%s base_url=%s request=%s",
+            self.resolved.stage,
+            self.resolved.route,
+            self.resolved.profile,
+            self.resolved.model_name,
+            self.resolved.base_url,
+            request_type,
         )
     
     def chat(
@@ -70,6 +95,8 @@ class LLMClient:
             kwargs["response_format"] = response_format
             
         kwargs["max_completion_tokens"] = max_tokens
+
+        self._log_request("chat")
         
         try:
             response = self.client.chat.completions.create(**kwargs)
@@ -120,4 +147,3 @@ class LLMClient:
             return json.loads(cleaned_response)
         except json.JSONDecodeError:
             raise ValueError(f"LLM返回的JSON格式无效: {cleaned_response}")
-

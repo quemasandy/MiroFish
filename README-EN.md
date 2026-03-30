@@ -116,11 +116,33 @@ cp .env.example .env
 
 ```env
 # LLM API Configuration (supports any LLM API with OpenAI SDK format)
+# Option A: Official OpenAI API
+# Note: ChatGPT Plus and API billing are separate. ChatGPT Plus does not include API credits.
+# Configure API billing at https://platform.openai.com/ before using this setup.
+# LLM_API_KEY=sk-...
+# LLM_BASE_URL=https://api.openai.com/v1
+# LLM_MODEL_NAME=gpt-4o-mini
+#
+# You can also use the standard OpenAI variable names:
+# OPENAI_API_KEY=sk-...
+# OPENAI_BASE_URL=https://api.openai.com/v1
+# OPENAI_MODEL_NAME=gpt-4o-mini
+#
+# Option B: Another OpenAI-compatible provider
 # Recommended: Alibaba Qwen-plus model via Bailian Platform: https://bailian.console.aliyun.com/
 # High consumption, try simulations with fewer than 40 rounds first
 LLM_API_KEY=your_api_key
 LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 LLM_MODEL_NAME=qwen-plus
+
+# Optional: hybrid routing (base model + premium model)
+# If both models use the same provider, you can set only LLM_PREMIUM_MODEL_NAME
+# If premium variables are omitted, all premium stages fall back to the base model
+LLM_PREMIUM_API_KEY=
+LLM_PREMIUM_BASE_URL=
+LLM_PREMIUM_MODEL_NAME=anthropic/claude-sonnet-4.6
+# Allowed values: conservative | balanced | max_quality
+LLM_ROUTING_PROFILE=balanced
 
 # Zep Cloud Configuration
 # Free monthly quota is sufficient for simple usage: https://app.getzep.com/

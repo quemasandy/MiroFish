@@ -17,6 +17,15 @@ else:
     load_dotenv(override=True)
 
 
+def _env_first(*keys: str, default=None):
+    """Return the first non-empty environment variable."""
+    for key in keys:
+        value = os.environ.get(key)
+        if value is not None and value != "":
+            return value
+    return default
+
+
 class Config:
     """Flask配置类"""
     
@@ -28,9 +37,23 @@ class Config:
     JSON_AS_ASCII = False
     
     # LLM配置（统一使用OpenAI格式）
-    LLM_API_KEY = os.environ.get('LLM_API_KEY')
-    LLM_BASE_URL = os.environ.get('LLM_BASE_URL', 'https://api.openai.com/v1')
-    LLM_MODEL_NAME = os.environ.get('LLM_MODEL_NAME', 'gpt-4o-mini')
+    # 兼容项目原有变量名和OpenAI常见变量名，便于直接切换到官方OpenAI API
+    LLM_API_KEY = _env_first('LLM_API_KEY', 'OPENAI_API_KEY')
+    LLM_BASE_URL = _env_first(
+        'LLM_BASE_URL',
+        'OPENAI_BASE_URL',
+        'OPENAI_API_BASE',
+        'OPENAI_API_BASE_URL',
+        default='https://api.openai.com/v1',
+    )
+    LLM_MODEL_NAME = _env_first('LLM_MODEL_NAME', 'OPENAI_MODEL_NAME', default='gpt-4o-mini')
+    LLM_PREMIUM_API_KEY = _env_first('LLM_PREMIUM_API_KEY', default=LLM_API_KEY)
+    LLM_PREMIUM_BASE_URL = _env_first(
+        'LLM_PREMIUM_BASE_URL',
+        default=LLM_BASE_URL,
+    )
+    LLM_PREMIUM_MODEL_NAME = _env_first('LLM_PREMIUM_MODEL_NAME', default='')
+    LLM_ROUTING_PROFILE = os.environ.get('LLM_ROUTING_PROFILE', 'balanced').strip().lower()
     
     # Neo4j配置（本地图数据库）
     NEO4J_URI = os.environ.get('NEO4J_URI', 'bolt://localhost:7687')
@@ -96,4 +119,3 @@ class Config:
         if not cls.NEO4J_PASSWORD:
             errors.append("NEO4J_PASSWORD 未配置")
         return errors
-

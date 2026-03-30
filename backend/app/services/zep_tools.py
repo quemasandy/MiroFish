@@ -113,8 +113,8 @@ class EdgeInfo:
     
     @property
     def is_expired(self) -> bool:
-        """是否已过期"""
-        return self.expired_at is not None
+        """Post Zep migration: no temporal data, never expired"""
+        return False
     
     @property
     def is_invalid(self) -> bool:
@@ -429,7 +429,7 @@ class ZepToolsService:
     def llm(self) -> LLMClient:
         """延迟初始化LLM客户端"""
         if self._llm_client is None:
-            self._llm_client = LLMClient()
+            self._llm_client = LLMClient(stage="report_tool_llm")
         return self._llm_client
     
     def _call_with_retry(self, func, operation_name: str, max_retries: int = None):

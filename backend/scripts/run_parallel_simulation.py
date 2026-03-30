@@ -37,6 +37,25 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 # ===================================
 
+# ====== TORCH/BLAS THREAD LIMITS (减少TwHIN推理卡死和内存峰值) ======
+_DEFAULT_TORCH_THREADS = max(1, int(os.environ.get("OASIS_TORCH_THREADS", "2")))
+for _thread_env in (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ.setdefault(_thread_env, str(_DEFAULT_TORCH_THREADS))
+
+_DEFAULT_RECSYS_EMBED_BATCH_SIZE = max(
+    1, int(os.environ.get("OASIS_RECSYS_EMBED_BATCH_SIZE", "32"))
+)
+_DEFAULT_TWHIN_POST_SAMPLE_SIZE = max(
+    100, int(os.environ.get("OASIS_TWHIN_POST_SAMPLE_SIZE", "1000"))
+)
+# ====================================================================
+
 # ====== HUGGINGFACE TIMEOUT (防止下载卡死) ======
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
 # ===============================================
@@ -45,6 +64,8 @@ os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
 # 这是最后一道防线：设置全局socket超时
 # 影响所有使用socket的库（包括transformers/huggingface/httpx等）
 import socket
+import logging
+
 _DEFAULT_SOCKET_TIMEOUT = int(os.environ.get('SOCKET_TIMEOUT', '60'))  # 降低到60秒
 socket.setdefaulttimeout(_DEFAULT_SOCKET_TIMEOUT)
 logging.info(f"[CONFIG] Global socket timeout set to {_DEFAULT_SOCKET_TIMEOUT}s")
@@ -118,6 +139,7 @@ import multiprocessing
 import random
 import signal
 import sqlite3
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -186,19 +208,20 @@ def disable_oasis_logging():
         logger.propagate = False
 
 
-def init_logging_for_simulation(simulation_dir: str):
+def init_logging_for_simulation(simulation_dir: str, clear_old_logs: bool = True):
     """
     初始化模拟的日志配置
     
     Args:
         simulation_dir: 模拟目录路径
+        clear_old_logs: 是否清理旧的 OASIS 内部日志目录
     """
     # 禁用 OASIS 的详细日志
     disable_oasis_logging()
     
     # 清理旧的 log 目录（如果存在）
     old_log_dir = os.path.join(simulation_dir, "log")
-    if os.path.exists(old_log_dir):
+    if clear_old_logs and os.path.exists(old_log_dir):
         import shutil
         shutil.rmtree(old_log_dir, ignore_errors=True)
 
@@ -220,6 +243,122 @@ except ImportError as e:
     logging.error(f"错误: 缺少依赖 {e}")
     logging.error("请先安装: pip install oasis-ai camel-ai")
     sys.exit(1)
+
+
+def patch_oasis_runtime_for_stability():
+    """
+    Reduce TwHIN recommendation spikes that can wedge the simulation process.
+
+    Notes:
+    - OASIS recalculates recommendation embeddings inside env.step().
+    - The upstream implementation uses very large embedding batches.
+    - On large simulations this can push torch/BLAS into long stalls.
+    """
+    try:
+        import torch
+        import oasis.social_platform.process_recsys_posts as oasis_recsys_posts
+        import oasis.social_platform.recsys as oasis_recsys
+        from oasis.social_platform.platform import Platform
+        from oasis.social_platform.typing import RecsysType
+
+        torch_threads = max(
+            1, int(os.environ.get("OASIS_TORCH_THREADS", str(_DEFAULT_TORCH_THREADS)))
+        )
+        torch_interop_threads = max(
+            1, int(os.environ.get("OASIS_TORCH_INTEROP_THREADS", "1"))
+        )
+        embed_batch_size = max(
+            1,
+            int(
+                os.environ.get(
+                    "OASIS_RECSYS_EMBED_BATCH_SIZE",
+                    str(_DEFAULT_RECSYS_EMBED_BATCH_SIZE),
+                )
+            ),
+        )
+        twhin_post_sample_size = max(
+            100,
+            int(
+                os.environ.get(
+                    "OASIS_TWHIN_POST_SAMPLE_SIZE",
+                    str(_DEFAULT_TWHIN_POST_SAMPLE_SIZE),
+                )
+            ),
+        )
+
+        try:
+            torch.set_num_threads(torch_threads)
+        except RuntimeError:
+            pass
+
+        try:
+            torch.set_num_interop_threads(torch_interop_threads)
+        except RuntimeError:
+            pass
+
+        if getattr(oasis_recsys, "_mirofish_stability_patched", False):
+            return
+
+        original_generate_post_vector = oasis_recsys_posts.generate_post_vector
+        original_generate_post_vector_openai = (
+            oasis_recsys_posts.generate_post_vector_openai
+        )
+        original_coarse_filtering = oasis_recsys.coarse_filtering
+        original_update_rec_table = Platform.update_rec_table
+
+        def _safe_generate_post_vector(model, tokenizer, texts, batch_size):
+            effective_batch_size = min(batch_size, embed_batch_size)
+            return original_generate_post_vector(
+                model, tokenizer, texts, effective_batch_size
+            )
+
+        def _safe_generate_post_vector_openai(texts, batch_size=100):
+            effective_batch_size = min(batch_size, embed_batch_size)
+            return original_generate_post_vector_openai(
+                texts, batch_size=effective_batch_size
+            )
+
+        def _safe_coarse_filtering(input_list, scale):
+            effective_scale = min(scale, twhin_post_sample_size)
+            return original_coarse_filtering(input_list, effective_scale)
+
+        async def _stable_update_rec_table(self):
+            if self.recsys_type == RecsysType.TWHIN:
+                post_count = self.db.execute("SELECT COUNT(*) FROM post").fetchone()[0]
+                last_post_count = getattr(self, "_mirofish_last_rec_post_count", None)
+                if last_post_count == post_count:
+                    logger.info(
+                        "[RECSYS] Skip TwHIN refresh because post count is unchanged: %s",
+                        post_count,
+                    )
+                    return
+                self._mirofish_last_rec_post_count = post_count
+            return await original_update_rec_table(self)
+
+        oasis_recsys_posts.generate_post_vector = _safe_generate_post_vector
+        oasis_recsys.generate_post_vector = _safe_generate_post_vector
+        oasis_recsys_posts.generate_post_vector_openai = (
+            _safe_generate_post_vector_openai
+        )
+        oasis_recsys.generate_post_vector_openai = _safe_generate_post_vector_openai
+        oasis_recsys.coarse_filtering = _safe_coarse_filtering
+        Platform.update_rec_table = _stable_update_rec_table
+        oasis_recsys._mirofish_stability_patched = True
+
+        logger.info(
+            "[CONFIG] OASIS stability patch enabled: torch_threads=%s, "
+            "torch_interop_threads=%s, recsys_embed_batch=%s, "
+            "twhin_post_sample_size=%s",
+            torch_threads,
+            torch_interop_threads,
+            embed_batch_size,
+            twhin_post_sample_size,
+        )
+    except Exception as e:
+        logger.warning(f"[CONFIG] Failed to patch OASIS runtime stability: {e}")
+
+
+patch_oasis_runtime_for_stability()
 
 
 # Twitter可用动作（不包含INTERVIEW，INTERVIEW只能通过ManualAction手动触发）
@@ -253,15 +392,9 @@ REDDIT_ACTIONS = [
 # ====== ENV.STEP() TIMEOUT WRAPPER ======
 # 防止OASIS模拟在网络问题时无限挂起
 
-import concurrent.futures
-import threading
-
 # 默认超时配置（可通过环境变量覆盖）
 ENV_STEP_TIMEOUT = int(os.environ.get('OASIS_ENV_STEP_TIMEOUT', '300'))
-ENV_STEP_MAX_RETRIES = int(os.environ.get('OASIS_ENV_STEP_MAX_RETRIES', '3'))
-
-# 全局线程池用于执行可能阻塞的同步操作
-_step_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="env_step")
+ENV_STEP_MAX_RETRIES = int(os.environ.get('OASIS_ENV_STEP_MAX_RETRIES', '1'))
 
 
 async def env_step_with_timeout(
@@ -272,71 +405,56 @@ async def env_step_with_timeout(
     step_description: str = "env.step()"
 ):
     """
-    带超时和重试的env.step()包装器
+    带超时的 env.step() 包装器
 
     防止以下情况导致的无限挂起：
     - BERT/Hugging Face模型下载卡住（CloudFront问题）
     - LLM API无响应
     - Neo4j连接断开
 
-    IMPORTANTE: env.step()内部可能有同步阻塞操作（如BERT模型推理），
-    asyncio.wait_for()无法中断这些操作。因此我们需要：
-    1. 在线程池中执行env.step()
-    2. 使用asyncio.wait_for()等待Future完成
-    3. 如果超时，Future会被取消（虽然线程可能继续运行，但至少不会阻塞主流程）
+    注意：
+    env.step() 是有状态操作。超时后重试同一个 step 可能造成重复执行、
+    日志错乱或环境状态不一致。因此这里默认不重试；如果调用方传入了
+    max_retries > 1，也会在首次超时后直接失败。
 
     Args:
         env: OASIS环境对象
         actions: 要执行的动作字典
         timeout: 超时秒数（默认300秒=5分钟）
-        max_retries: 最大重试次数（默认3次）
+        max_retries: 保留兼容参数；超时后不会安全重试
         step_description: 日志描述（用于调试）
 
     Returns:
         env.step()的返回值
 
     Raises:
-        TimeoutError: 所有重试都超时
+        TimeoutError: step 超时
     """
-    loop = asyncio.get_event_loop()
+    try:
+        step_result = env.step(actions)
 
-    for attempt in range(max_retries):
-        try:
-            # 检查env.step是否是协程函数
-            step_result = env.step(actions)
-
-            if asyncio.iscoroutine(step_result):
-                # 如果是协程，直接await
-                # 但为了让timeout能工作，我们用wait_for包装
-                # 并在线程池中运行一个检查超时的监控
-                return await asyncio.wait_for(step_result, timeout=timeout)
-            else:
-                # 如果不是协程（不太可能），直接返回
-                return step_result
-
-        except asyncio.TimeoutError:
-            logger.warning(f"[TIMEOUT] {step_description} 超时 (尝试 {attempt + 1}/{max_retries}), "
-                  f"timeout={timeout}s")
-            if attempt < max_retries - 1:
-                # 指数退避：2秒、4秒、8秒...
-                wait_time = 2 ** (attempt + 1)
-                logger.warning(f"[TIMEOUT] 等待 {wait_time}s 后重试...")
-                await asyncio.sleep(wait_time)
-            else:
-                raise TimeoutError(
-                    f"{step_description} 在 {max_retries} 次尝试后仍然超时 "
-                    f"(每次超时 {timeout}s)"
-                )
-        except asyncio.CancelledError:
-            logger.warning(f"[CANCELLED] {step_description} 被取消")
-            raise
-        except Exception as e:
-            # 非超时异常直接抛出，不重试
-            logger.error(f"[ERROR] {step_description} 发生异常: {e}")
-            raise
-
-    # 不应该到达这里，但为了安全
-    raise TimeoutError(f"{step_description} 失败")
+        if asyncio.iscoroutine(step_result):
+            return await asyncio.wait_for(step_result, timeout=timeout)
+        return step_result
+    except asyncio.TimeoutError as e:
+        logger.warning(
+            "[TIMEOUT] %s 超时, timeout=%ss. "
+            "已停止重试以避免对同一 env.step 重入。",
+            step_description,
+            timeout,
+        )
+        if max_retries > 1:
+            logger.warning(
+                "[TIMEOUT] 已忽略 max_retries=%s，因为 env.step 超时后重试不安全。",
+                max_retries,
+            )
+        raise TimeoutError(f"{step_description} 超时 (timeout={timeout}s)") from e
+    except asyncio.CancelledError:
+        logger.warning(f"[CANCELLED] {step_description} 被取消")
+        raise
+    except Exception as e:
+        logger.error(f"[ERROR] {step_description} 发生异常: {e}")
+        raise
 
 # ==========================================
 
@@ -426,8 +544,10 @@ class ParallelIPCHandler:
         }
         
         response_file = os.path.join(self.responses_dir, f"{command_id}.json")
-        with open(response_file, 'w', encoding='utf-8') as f:
+        tmp_file = response_file + ".tmp"
+        with open(tmp_file, 'w', encoding='utf-8') as f:
             json.dump(response, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_file, response_file)
         
         # 删除命令文件
         command_file = os.path.join(self.commands_dir, f"{command_id}.json")
@@ -677,29 +797,29 @@ class ParallelIPCHandler:
         
         try:
             conn = sqlite3.connect(db_path)
-            cursor = conn.cursor()
-            
-            # 查询最新的Interview记录
-            cursor.execute("""
-                SELECT user_id, info, created_at
-                FROM trace
-                WHERE action = ? AND user_id = ?
-                ORDER BY created_at DESC
-                LIMIT 1
-            """, (ActionType.INTERVIEW.value, agent_id))
-            
-            row = cursor.fetchone()
-            if row:
-                user_id, info_json, created_at = row
-                try:
-                    info = json.loads(info_json) if info_json else {}
-                    result["response"] = info.get("response", info)
-                    result["timestamp"] = created_at
-                except json.JSONDecodeError:
-                    result["response"] = info_json
-            
-            conn.close()
-            
+            try:
+                cursor = conn.cursor()
+
+                cursor.execute("""
+                    SELECT user_id, info, created_at
+                    FROM trace
+                    WHERE action = ? AND user_id = ?
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """, (ActionType.INTERVIEW.value, agent_id))
+
+                row = cursor.fetchone()
+                if row:
+                    user_id, info_json, created_at = row
+                    try:
+                        info = json.loads(info_json) if info_json else {}
+                        result["response"] = info.get("response", info)
+                        result["timestamp"] = created_at
+                    except json.JSONDecodeError:
+                        result["response"] = info_json
+            finally:
+                conn.close()
+
         except Exception as e:
             logger.warning(f"  读取Interview结果失败: {e}")
         
@@ -828,66 +948,59 @@ def fetch_new_actions_from_db(
     
     try:
         conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        
-        # 使用 rowid 来追踪已处理的记录（rowid 是 SQLite 的内置自增字段）
-        # 这样可以避免 created_at 格式差异问题（Twitter 用整数，Reddit 用日期时间字符串）
-        cursor.execute("""
-            SELECT rowid, user_id, action, info
-            FROM trace
-            WHERE rowid > ?
-            ORDER BY rowid ASC
-        """, (last_rowid,))
-        
-        for rowid, user_id, action, info_json in cursor.fetchall():
-            # 更新最大 rowid
-            new_last_rowid = rowid
-            
-            # 过滤非核心动作
-            if action in FILTERED_ACTIONS:
-                continue
-            
-            # 解析动作参数
-            try:
-                action_args = json.loads(info_json) if info_json else {}
-            except json.JSONDecodeError:
-                action_args = {}
-            
-            # 精简 action_args，只保留关键字段（保留完整内容，不截断）
-            simplified_args = {}
-            if 'content' in action_args:
-                simplified_args['content'] = action_args['content']
-            if 'post_id' in action_args:
-                simplified_args['post_id'] = action_args['post_id']
-            if 'comment_id' in action_args:
-                simplified_args['comment_id'] = action_args['comment_id']
-            if 'quoted_id' in action_args:
-                simplified_args['quoted_id'] = action_args['quoted_id']
-            if 'new_post_id' in action_args:
-                simplified_args['new_post_id'] = action_args['new_post_id']
-            if 'follow_id' in action_args:
-                simplified_args['follow_id'] = action_args['follow_id']
-            if 'query' in action_args:
-                simplified_args['query'] = action_args['query']
-            if 'like_id' in action_args:
-                simplified_args['like_id'] = action_args['like_id']
-            if 'dislike_id' in action_args:
-                simplified_args['dislike_id'] = action_args['dislike_id']
-            
-            # 转换动作类型名称
-            action_type = ACTION_TYPE_MAP.get(action, action.upper())
-            
-            # 补充上下文信息（帖子内容、用户名等）
-            _enrich_action_context(cursor, action_type, simplified_args, agent_names)
-            
-            actions.append({
-                'agent_id': user_id,
-                'agent_name': agent_names.get(user_id, f'Agent_{user_id}'),
-                'action_type': action_type,
-                'action_args': simplified_args,
-            })
-        
-        conn.close()
+        try:
+            cursor = conn.cursor()
+
+            cursor.execute("""
+                SELECT rowid, user_id, action, info
+                FROM trace
+                WHERE rowid > ?
+                ORDER BY rowid ASC
+            """, (last_rowid,))
+
+            for rowid, user_id, action, info_json in cursor.fetchall():
+                new_last_rowid = rowid
+
+                if action in FILTERED_ACTIONS:
+                    continue
+
+                try:
+                    action_args = json.loads(info_json) if info_json else {}
+                except json.JSONDecodeError:
+                    action_args = {}
+
+                simplified_args = {}
+                if 'content' in action_args:
+                    simplified_args['content'] = action_args['content']
+                if 'post_id' in action_args:
+                    simplified_args['post_id'] = action_args['post_id']
+                if 'comment_id' in action_args:
+                    simplified_args['comment_id'] = action_args['comment_id']
+                if 'quoted_id' in action_args:
+                    simplified_args['quoted_id'] = action_args['quoted_id']
+                if 'new_post_id' in action_args:
+                    simplified_args['new_post_id'] = action_args['new_post_id']
+                if 'follow_id' in action_args:
+                    simplified_args['follow_id'] = action_args['follow_id']
+                if 'query' in action_args:
+                    simplified_args['query'] = action_args['query']
+                if 'like_id' in action_args:
+                    simplified_args['like_id'] = action_args['like_id']
+                if 'dislike_id' in action_args:
+                    simplified_args['dislike_id'] = action_args['dislike_id']
+
+                action_type = ACTION_TYPE_MAP.get(action, action.upper())
+
+                _enrich_action_context(cursor, action_type, simplified_args, agent_names)
+
+                actions.append({
+                    'agent_id': user_id,
+                    'agent_name': agent_names.get(user_id, f'Agent_{user_id}'),
+                    'action_type': action_type,
+                    'action_args': simplified_args,
+                })
+        finally:
+            conn.close()
     except Exception as e:
         logger.warning(f"读取数据库动作失败: {e}")
     
@@ -998,8 +1111,7 @@ def _enrich_action_context(
                     action_args['post_author_name'] = post_info.get('author_name', '')
     
     except Exception as e:
-        # 补充上下文失败不影响主流程
-        logger.debug(f"补充动作上下文失败: {e}")
+        logger.warning(f"补充动作上下文失败 (action={action_type}): {e}")
 
 
 def _get_post_info(
@@ -1238,12 +1350,564 @@ def get_active_agents_for_round(
     return active_agents
 
 
+@dataclass
+class ReplayActionSpec:
+    agent_id: int
+    action_type: ActionType
+    action_args: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ReplayRoundSpec:
+    round_num: int
+    actions: List[ReplayActionSpec] = field(default_factory=list)
+
+
+@dataclass
+class PlatformResumePlan:
+    platform: str
+    artifacts_found: bool = False
+    has_checkpoint: bool = False
+    last_completed_round: int = 0
+    total_actions: int = 0
+    rounds: List[ReplayRoundSpec] = field(default_factory=list)
+
+
+def _get_effective_total_rounds(
+    config: Dict[str, Any],
+    max_rounds: Optional[int] = None
+) -> int:
+    """根据配置和 max_rounds 计算实际执行轮数。"""
+    time_config = config.get("time_config", {})
+    total_hours = time_config.get("total_simulation_hours", 72)
+    minutes_per_round = time_config.get("minutes_per_round", 30)
+    total_rounds = (total_hours * 60) // minutes_per_round
+
+    if max_rounds is not None and max_rounds > 0:
+        total_rounds = min(total_rounds, max_rounds)
+
+    return total_rounds
+
+
+def _collect_completed_round_entries(
+    log_path: str,
+    total_rounds: int
+) -> Tuple[bool, List[Tuple[int, List[Dict[str, Any]]]]]:
+    """
+    从 actions.jsonl 中提取已完整结束轮次及其动作条数。
+
+    只信任 round_end；未完成轮次的动作不会参与恢复。
+    """
+    artifacts_found = os.path.exists(log_path) and os.path.getsize(log_path) > 0
+    if not os.path.exists(log_path):
+        return artifacts_found, []
+
+    actions_by_round: Dict[int, List[Dict[str, Any]]] = {}
+    completed_rounds = set()
+
+    with open(log_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            round_num = data.get("round")
+            if not isinstance(round_num, int) or round_num < 0:
+                continue
+            if total_rounds > 0 and round_num > total_rounds:
+                continue
+
+            if data.get("event_type") == "round_end":
+                completed_rounds.add(round_num)
+            elif "event_type" not in data:
+                actions_by_round.setdefault(round_num, []).append(data)
+
+    ordered_rounds = sorted(completed_rounds)
+    return artifacts_found, [
+        (round_num, actions_by_round.get(round_num, []))
+        for round_num in ordered_rounds
+    ]
+
+
+def _truncate_action_log_to_last_checkpoint(
+    log_path: str,
+    total_rounds: int
+) -> Dict[str, Any]:
+    """
+    将 actions.jsonl 截断到最后一个有效的 round_end。
+
+    这样可以在 resume 前移除崩溃留下的脏尾巴，例如：
+    - 已写入的下一轮 round_start 但没有 round_end
+    - 超出本次 max_rounds 的历史残留
+    - 旧 simulation_end / round_end 混入新的恢复目标
+    """
+    if not os.path.exists(log_path):
+        return {
+            "exists": False,
+            "truncated": False,
+            "kept_round": 0,
+            "dropped_lines": 0,
+        }
+
+    with open(log_path, 'r', encoding='utf-8') as f:
+        raw_lines = f.readlines()
+
+    completed_rounds = set()
+    parsed_lines = []
+
+    for raw_line in raw_lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            parsed_lines.append((raw_line, None))
+            continue
+
+        parsed_lines.append((raw_line, data))
+
+        round_num = data.get("round")
+        if (
+            data.get("event_type") == "round_end"
+            and isinstance(round_num, int)
+            and round_num >= 0
+            and (total_rounds <= 0 or round_num <= total_rounds)
+        ):
+            completed_rounds.add(round_num)
+
+    if not completed_rounds:
+        return {
+            "exists": True,
+            "truncated": False,
+            "kept_round": 0,
+            "dropped_lines": 0,
+        }
+
+    last_checkpoint_round = max(completed_rounds)
+    kept_lines = []
+    kept_simulation_start = False
+
+    for raw_line, data in parsed_lines:
+        if data is None:
+            continue
+
+        event_type = data.get("event_type")
+        round_num = data.get("round")
+
+        if event_type == "simulation_start":
+            if not kept_simulation_start:
+                kept_lines.append(raw_line)
+                kept_simulation_start = True
+            continue
+
+        if event_type == "simulation_end":
+            continue
+
+        if not isinstance(round_num, int) or round_num < 0:
+            continue
+        if round_num not in completed_rounds:
+            continue
+        if total_rounds > 0 and round_num > total_rounds:
+            continue
+        if round_num > last_checkpoint_round:
+            continue
+
+        kept_lines.append(raw_line)
+
+    dropped_lines = len(raw_lines) - len(kept_lines)
+
+    if dropped_lines > 0:
+        with open(log_path, 'w', encoding='utf-8') as f:
+            f.writelines(kept_lines)
+
+    return {
+        "exists": True,
+        "truncated": dropped_lines > 0,
+        "kept_round": last_checkpoint_round,
+        "dropped_lines": dropped_lines,
+    }
+
+
+def _sanitize_resume_action_logs(
+    simulation_dir: str,
+    total_rounds: int,
+    log_info=logger.info
+):
+    """在 resume 前清掉超出最后有效检查点的日志尾巴。"""
+    for platform in ("twitter", "reddit"):
+        log_path = os.path.join(simulation_dir, platform, "actions.jsonl")
+        result = _truncate_action_log_to_last_checkpoint(log_path, total_rounds)
+        if result["truncated"]:
+            log_info(
+                f"[{platform.capitalize()}] 已清理恢复日志尾部: "
+                f"kept_round={result['kept_round']}, dropped_lines={result['dropped_lines']}"
+            )
+
+
+def _build_replay_action_from_log_entry(
+    action_entry: Dict[str, Any]
+) -> Optional[ReplayActionSpec]:
+    """优先使用 actions.jsonl 自身内容构建可重放动作。"""
+    agent_id = action_entry.get("agent_id")
+    action_type = action_entry.get("action_type")
+    action_args = action_entry.get("action_args") or {}
+
+    if agent_id is None or not action_type:
+        return None
+
+    if action_type == "CREATE_POST" and action_args.get("content") is not None:
+        return ReplayActionSpec(agent_id, ActionType.CREATE_POST, {"content": action_args["content"]})
+
+    if action_type == "LIKE_POST" and action_args.get("post_id") is not None:
+        return ReplayActionSpec(agent_id, ActionType.LIKE_POST, {"post_id": action_args["post_id"]})
+
+    if action_type == "DISLIKE_POST" and action_args.get("post_id") is not None:
+        return ReplayActionSpec(agent_id, ActionType.DISLIKE_POST, {"post_id": action_args["post_id"]})
+
+    if action_type == "SEARCH_POSTS" and action_args.get("query") is not None:
+        return ReplayActionSpec(agent_id, ActionType.SEARCH_POSTS, {"query": action_args["query"]})
+
+    if action_type == "SEARCH_USER" and action_args.get("query") is not None:
+        return ReplayActionSpec(agent_id, ActionType.SEARCH_USER, {"query": action_args["query"]})
+
+    if action_type == "LIKE_COMMENT" and action_args.get("comment_id") is not None:
+        return ReplayActionSpec(agent_id, ActionType.LIKE_COMMENT, {"comment_id": action_args["comment_id"]})
+
+    if action_type == "DISLIKE_COMMENT" and action_args.get("comment_id") is not None:
+        return ReplayActionSpec(agent_id, ActionType.DISLIKE_COMMENT, {"comment_id": action_args["comment_id"]})
+
+    if action_type == "QUOTE_POST":
+        quoted_id = action_args.get("quoted_id")
+        quote_content = action_args.get("quote_content")
+        if quoted_id is not None and quote_content is not None:
+            return ReplayActionSpec(
+                agent_id,
+                ActionType.QUOTE_POST,
+                {"quote_message": (quoted_id, quote_content)}
+            )
+
+    if action_type == "TREND":
+        return ReplayActionSpec(agent_id, ActionType.TREND, {})
+
+    if action_type == "DO_NOTHING":
+        return ReplayActionSpec(agent_id, ActionType.DO_NOTHING, {})
+
+    return None
+
+
+def _lookup_followee_id(cursor, follow_id: int) -> Optional[int]:
+    cursor.execute(
+        "SELECT followee_id FROM follow WHERE follow_id = ?",
+        (follow_id,),
+    )
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+
+def _lookup_reposted_id(cursor, new_post_id: int) -> Optional[int]:
+    cursor.execute(
+        "SELECT original_post_id FROM post WHERE post_id = ?",
+        (new_post_id,),
+    )
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+
+def _lookup_quote_content(cursor, new_post_id: int) -> Optional[str]:
+    cursor.execute(
+        "SELECT quote_content FROM post WHERE post_id = ?",
+        (new_post_id,),
+    )
+    row = cursor.fetchone()
+    return row[0] if row and row[0] is not None else None
+
+
+def _lookup_comment_post_id(cursor, comment_id: int) -> Optional[int]:
+    cursor.execute(
+        "SELECT post_id FROM comment WHERE comment_id = ?",
+        (comment_id,),
+    )
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+
+def _build_replay_action_spec(
+    cursor,
+    user_id: int,
+    action_name: str,
+    info_json: str
+) -> Optional[ReplayActionSpec]:
+    """把旧 trace 记录翻译成可顺序重放的 ManualAction 规格。"""
+    try:
+        action_info = json.loads(info_json) if info_json else {}
+    except json.JSONDecodeError:
+        action_info = {}
+
+    if action_name == "create_post":
+        content = action_info.get("content")
+        if content is None:
+            return None
+        return ReplayActionSpec(user_id, ActionType.CREATE_POST, {"content": content})
+
+    if action_name == "like_post":
+        post_id = action_info.get("post_id")
+        if post_id is None:
+            return None
+        return ReplayActionSpec(user_id, ActionType.LIKE_POST, {"post_id": post_id})
+
+    if action_name == "dislike_post":
+        post_id = action_info.get("post_id")
+        if post_id is None:
+            return None
+        return ReplayActionSpec(user_id, ActionType.DISLIKE_POST, {"post_id": post_id})
+
+    if action_name == "repost":
+        post_id = action_info.get("reposted_id")
+        if post_id is None:
+            post_id = _lookup_reposted_id(cursor, action_info.get("new_post_id"))
+        if post_id is None:
+            return None
+        return ReplayActionSpec(user_id, ActionType.REPOST, {"post_id": post_id})
+
+    if action_name == "quote_post":
+        quoted_id = action_info.get("quoted_id")
+        quote_content = _lookup_quote_content(cursor, action_info.get("new_post_id"))
+        if quoted_id is None or quote_content is None:
+            return None
+        return ReplayActionSpec(
+            user_id,
+            ActionType.QUOTE_POST,
+            {"quote_message": (quoted_id, quote_content)}
+        )
+
+    if action_name == "follow":
+        followee_id = action_info.get("followee_id")
+        if followee_id is None:
+            followee_id = _lookup_followee_id(cursor, action_info.get("follow_id"))
+        if followee_id is None:
+            return None
+        return ReplayActionSpec(
+            user_id,
+            ActionType.FOLLOW,
+            {"followee_id": followee_id}
+        )
+
+    if action_name == "mute":
+        mutee_id = action_info.get("mutee_id")
+        if mutee_id is None:
+            return None
+        return ReplayActionSpec(
+            user_id,
+            ActionType.MUTE,
+            {"mutee_id": mutee_id}
+        )
+
+    if action_name == "create_comment":
+        post_id = _lookup_comment_post_id(cursor, action_info.get("comment_id"))
+        content = action_info.get("content")
+        if post_id is None or content is None:
+            return None
+        return ReplayActionSpec(
+            user_id,
+            ActionType.CREATE_COMMENT,
+            {"comment_message": (post_id, content)}
+        )
+
+    if action_name == "like_comment":
+        comment_id = action_info.get("comment_id")
+        if comment_id is None:
+            return None
+        return ReplayActionSpec(
+            user_id,
+            ActionType.LIKE_COMMENT,
+            {"comment_id": comment_id}
+        )
+
+    if action_name == "dislike_comment":
+        comment_id = action_info.get("comment_id")
+        if comment_id is None:
+            return None
+        return ReplayActionSpec(
+            user_id,
+            ActionType.DISLIKE_COMMENT,
+            {"comment_id": comment_id}
+        )
+
+    if action_name == "search_posts":
+        query = action_info.get("query")
+        if query is None:
+            return None
+        return ReplayActionSpec(
+            user_id,
+            ActionType.SEARCH_POSTS,
+            {"query": query}
+        )
+
+    if action_name == "search_user":
+        query = action_info.get("query")
+        if query is None:
+            return None
+        return ReplayActionSpec(
+            user_id,
+            ActionType.SEARCH_USER,
+            {"query": query}
+        )
+
+    if action_name == "trend":
+        return ReplayActionSpec(user_id, ActionType.TREND, {})
+
+    if action_name == "do_nothing":
+        return ReplayActionSpec(user_id, ActionType.DO_NOTHING, {})
+
+    logger.warning("[RESUME] Unsupported replay action: %s", action_name)
+    return None
+
+
+def load_platform_resume_plan(
+    platform: str,
+    simulation_dir: str,
+    total_rounds: int,
+    log_info=logger.info
+) -> PlatformResumePlan:
+    """从平台日志和旧数据库构建恢复计划。"""
+    log_path = os.path.join(simulation_dir, platform, "actions.jsonl")
+    db_path = os.path.join(simulation_dir, f"{platform}_simulation.db")
+
+    artifacts_found, completed_rounds = _collect_completed_round_entries(
+        log_path, total_rounds
+    )
+    artifacts_found = artifacts_found or (
+        os.path.exists(db_path) and os.path.getsize(db_path) > 0
+    )
+    plan = PlatformResumePlan(platform=platform, artifacts_found=artifacts_found)
+
+    if not completed_rounds:
+        if artifacts_found:
+            raise RuntimeError(f"{platform} 检测到历史痕迹，但没有有效的 round_end 检查点")
+        return plan
+    if not os.path.exists(db_path):
+        raise RuntimeError(f"{platform} 存在历史日志，但数据库不存在，无法恢复")
+
+    replayable_actions_count = sum(len(actions) for _, actions in completed_rounds)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT rowid, user_id, action, info
+            FROM trace
+            WHERE action NOT IN (?, ?, ?)
+            ORDER BY rowid ASC
+            """,
+            ("sign_up", "refresh", "interview"),
+        )
+        trace_rows = cursor.fetchall()
+
+        row_index = 0
+        for round_num, action_entries in completed_rounds:
+            expected_count = len(action_entries)
+            available_count = max(0, min(expected_count, len(trace_rows) - row_index))
+            round_trace_rows = trace_rows[row_index:row_index + available_count]
+            round_spec = ReplayRoundSpec(round_num=round_num)
+            for index, action_entry in enumerate(action_entries):
+                replay_action = _build_replay_action_from_log_entry(action_entry)
+                if replay_action is None and index < len(round_trace_rows):
+                    _, user_id, action_name, info_json = round_trace_rows[index]
+                    replay_action = _build_replay_action_spec(cursor, user_id, action_name, info_json)
+                if replay_action is None:
+                    raise RuntimeError(
+                        f"{platform} 无法恢复动作: round={round_num}, action={action_entry.get('action_type')}, agent_id={action_entry.get('agent_id')}"
+                    )
+                round_spec.actions.append(replay_action)
+
+            plan.rounds.append(round_spec)
+            row_index += available_count
+
+        plan.has_checkpoint = True
+        plan.last_completed_round = plan.rounds[-1].round_num
+        plan.total_actions = replayable_actions_count
+        log_info(
+            f"[{platform.capitalize()}] 检测到恢复检查点: "
+            f"last_round={plan.last_completed_round}, actions={plan.total_actions}"
+        )
+        return plan
+    finally:
+        conn.close()
+
+
+async def replay_platform_state(
+    env,
+    resume_plan: PlatformResumePlan,
+    platform_label: str,
+    log_info=logger.info
+) -> int:
+    """
+    顺序重放已完成轮次，重建平台 DB 和 Agent memory。
+
+    注意：这里故意不用 env.step()，而是按 trace 原始顺序逐条执行，
+    以保持 post/comment/follow 的自增 ID 与原运行一致。
+    """
+    if not resume_plan.has_checkpoint:
+        return 0
+
+    log_info(
+        f"[{platform_label}] 开始重放 {len(resume_plan.rounds)} 个完整轮次 "
+        f"({resume_plan.total_actions} 条动作)"
+    )
+
+    replayed_actions = 0
+
+    for round_spec in resume_plan.rounds:
+        if round_spec.actions:
+            await env.platform.update_rec_table()
+            for action_spec in round_spec.actions:
+                agent = env.agent_graph.get_agent(action_spec.agent_id)
+                await agent.perform_action_by_data(
+                    action_spec.action_type,
+                    **action_spec.action_args
+                )
+                replayed_actions += 1
+
+            if env.platform_type == oasis.DefaultPlatformType.TWITTER:
+                env.platform.sandbox_clock.time_step += 1
+
+    log_info(
+        f"[{platform_label}] 历史状态重放完成: "
+        f"last_round={resume_plan.last_completed_round}, actions={replayed_actions}"
+    )
+    return replayed_actions
+
+
+def get_last_trace_rowid(db_path: str) -> int:
+    """获取 trace 表当前最大 rowid。"""
+    if not os.path.exists(db_path):
+        return 0
+
+    conn = sqlite3.connect(db_path)
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COALESCE(MAX(rowid), 0) FROM trace")
+        row = cursor.fetchone()
+        return int(row[0] or 0)
+    finally:
+        conn.close()
+
+
 class PlatformSimulation:
     """平台模拟结果容器"""
     def __init__(self):
         self.env = None
         self.agent_graph = None
         self.total_actions = 0
+        self.resume_plan = None
 
 
 async def run_twitter_simulation(
@@ -1251,7 +1915,8 @@ async def run_twitter_simulation(
     simulation_dir: str,
     action_logger: Optional[PlatformActionLogger] = None,
     main_logger: Optional[SimulationLogManager] = None,
-    max_rounds: Optional[int] = None
+    max_rounds: Optional[int] = None,
+    resume: bool = False
 ) -> PlatformSimulation:
     """运行Twitter模拟
     
@@ -1261,6 +1926,7 @@ async def run_twitter_simulation(
         action_logger: 动作日志记录器
         main_logger: 主日志管理器
         max_rounds: 最大模拟轮数（可选，用于截断过长的模拟）
+        resume: 是否从最后一个有效检查点恢复
         
     Returns:
         PlatformSimulation: 包含env和agent_graph的结果对象
@@ -1273,6 +1939,19 @@ async def run_twitter_simulation(
         logger.info(f"[Twitter] {msg}")
     
     log_info("初始化...")
+
+    time_config = config.get("time_config", {})
+    minutes_per_round = time_config.get("minutes_per_round", 30)
+    total_rounds = _get_effective_total_rounds(config, max_rounds)
+    resume_plan = None
+    if resume:
+        resume_plan = load_platform_resume_plan(
+            "twitter",
+            simulation_dir,
+            total_rounds,
+            log_info=log_info
+        )
+        result.resume_plan = resume_plan
     
     # Twitter 使用通用 LLM 配置
     model = create_model(config, use_boost=False)
@@ -1309,74 +1988,86 @@ async def run_twitter_simulation(
     
     await result.env.reset()
     log_info("环境已启动")
-    
-    if action_logger:
-        action_logger.log_simulation_start(config)
-    
+
     total_actions = 0
     last_rowid = 0  # 跟踪数据库中最后处理的行号（使用 rowid 避免 created_at 格式差异）
-    
-    # 执行初始事件
-    event_config = config.get("event_config", {})
-    initial_posts = event_config.get("initial_posts", [])
-    
-    # 记录 round 0 开始（初始事件阶段）
-    if action_logger:
-        action_logger.log_round_start(0, 0)  # round 0, simulated_hour 0
-    
-    initial_action_count = 0
-    if initial_posts:
-        initial_actions = {}
-        for post in initial_posts:
-            agent_id = post.get("poster_agent_id", 0)
-            content = post.get("content", "")
-            try:
-                agent = result.env.agent_graph.get_agent(agent_id)
-                initial_actions[agent] = ManualAction(
-                    action_type=ActionType.CREATE_POST,
-                    action_args={"content": content}
-                )
+    start_round_num = 0
 
-                if action_logger:
-                    action_logger.log_action(
-                        round_num=0,
-                        agent_id=agent_id,
-                        agent_name=agent_names.get(agent_id, f"Agent_{agent_id}"),
-                        action_type="CREATE_POST",
+    if resume_plan and resume_plan.has_checkpoint:
+        total_actions = await replay_platform_state(
+            result.env,
+            resume_plan,
+            "Twitter",
+            log_info=log_info
+        )
+        last_rowid = get_last_trace_rowid(db_path)
+        start_round_num = resume_plan.last_completed_round
+        log_info(
+            f"恢复完成，将从第 {start_round_num + 1} 轮继续 "
+            f"(已恢复 {total_actions} 条动作)"
+        )
+    else:
+        if action_logger:
+            action_logger.log_simulation_start(config)
+
+        # 执行初始事件
+        event_config = config.get("event_config", {})
+        initial_posts = event_config.get("initial_posts", [])
+
+        # 记录 round 0 开始（初始事件阶段）
+        if action_logger:
+            action_logger.log_round_start(0, 0)  # round 0, simulated_hour 0
+
+        initial_action_count = 0
+        if initial_posts:
+            initial_actions = {}
+            for post in initial_posts:
+                agent_id = post.get("poster_agent_id", 0)
+                content = post.get("content", "")
+                try:
+                    agent = result.env.agent_graph.get_agent(agent_id)
+                    initial_actions[agent] = ManualAction(
+                        action_type=ActionType.CREATE_POST,
                         action_args={"content": content}
                     )
-                    total_actions += 1
-                    initial_action_count += 1
-            except Exception as e:
-                logger.warning(f"创建Twitter初始帖子失败 (agent_id={agent_id}): {e}")
 
-        if initial_actions:
-            await env_step_with_timeout(
-                result.env, initial_actions,
-                step_description=f"Twitter initial posts ({len(initial_actions)} posts)"
-            )
-            log_info(f"已发布 {len(initial_actions)} 条初始帖子")
+                    if action_logger:
+                        action_logger.log_action(
+                            round_num=0,
+                            agent_id=agent_id,
+                            agent_name=agent_names.get(agent_id, f"Agent_{agent_id}"),
+                            action_type="CREATE_POST",
+                            action_args={"content": content}
+                        )
+                        total_actions += 1
+                        initial_action_count += 1
+                except Exception as e:
+                    logger.warning(f"创建Twitter初始帖子失败 (agent_id={agent_id}): {e}")
 
-    # 记录 round 0 结束
-    if action_logger:
-        action_logger.log_round_end(0, initial_action_count)
-    
-    # 主模拟循环
-    time_config = config.get("time_config", {})
-    total_hours = time_config.get("total_simulation_hours", 72)
-    minutes_per_round = time_config.get("minutes_per_round", 30)
-    total_rounds = (total_hours * 60) // minutes_per_round
-    
-    # 如果指定了最大轮数，则截断
-    if max_rounds is not None and max_rounds > 0:
-        original_rounds = total_rounds
-        total_rounds = min(total_rounds, max_rounds)
-        if total_rounds < original_rounds:
-            log_info(f"轮数已截断: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})")
+            if initial_actions:
+                await env_step_with_timeout(
+                    result.env, initial_actions,
+                    step_description=f"Twitter initial posts ({len(initial_actions)} posts)"
+                )
+                log_info(f"已发布 {len(initial_actions)} 条初始帖子")
+
+        # 记录 round 0 结束
+        if action_logger:
+            action_logger.log_round_end(0, initial_action_count)
+
+        if max_rounds is not None and max_rounds > 0:
+            config_total_rounds = _get_effective_total_rounds(config, None)
+            if total_rounds < config_total_rounds:
+                log_info(f"轮数已截断: {config_total_rounds} -> {total_rounds} (max_rounds={max_rounds})")
     
     start_time = datetime.now()
+
+    if start_round_num >= total_rounds:
+        result.total_actions = total_actions
+        log_info(f"恢复检查点已达到目标轮次 ({start_round_num}/{total_rounds})，无需继续模拟")
+        return result
     
-    for round_num in range(total_rounds):
+    for round_num in range(start_round_num, total_rounds):
         # 检查是否收到退出信号
         if _shutdown_event and _shutdown_event.is_set():
             if main_logger:
@@ -1402,10 +2093,16 @@ async def run_twitter_simulation(
             continue
         
         actions = {agent: LLMAction() for _, agent in active_agents}
-        await env_step_with_timeout(
-            result.env, actions,
-            step_description=f"Twitter round {round_num + 1} ({len(active_agents)} agents)"
-        )
+        try:
+            await env_step_with_timeout(
+                result.env, actions,
+                step_description=f"Twitter round {round_num + 1} ({len(active_agents)} agents)"
+            )
+        except (TimeoutError, Exception) as e:
+            log_info(f"Round {round_num + 1} 失败，跳过此轮: {e}")
+            if action_logger:
+                action_logger.log_round_end(round_num + 1, 0)
+            continue
 
         # 从数据库获取实际执行的动作并记录
         actual_actions, last_rowid = fetch_new_actions_from_db(
@@ -1449,7 +2146,8 @@ async def run_reddit_simulation(
     simulation_dir: str,
     action_logger: Optional[PlatformActionLogger] = None,
     main_logger: Optional[SimulationLogManager] = None,
-    max_rounds: Optional[int] = None
+    max_rounds: Optional[int] = None,
+    resume: bool = False
 ) -> PlatformSimulation:
     """运行Reddit模拟
     
@@ -1459,6 +2157,7 @@ async def run_reddit_simulation(
         action_logger: 动作日志记录器
         main_logger: 主日志管理器
         max_rounds: 最大模拟轮数（可选，用于截断过长的模拟）
+        resume: 是否从最后一个有效检查点恢复
         
     Returns:
         PlatformSimulation: 包含env和agent_graph的结果对象
@@ -1471,6 +2170,19 @@ async def run_reddit_simulation(
         logger.info(f"[Reddit] {msg}")
     
     log_info("初始化...")
+
+    time_config = config.get("time_config", {})
+    minutes_per_round = time_config.get("minutes_per_round", 30)
+    total_rounds = _get_effective_total_rounds(config, max_rounds)
+    resume_plan = None
+    if resume:
+        resume_plan = load_platform_resume_plan(
+            "reddit",
+            simulation_dir,
+            total_rounds,
+            log_info=log_info
+        )
+        result.resume_plan = resume_plan
     
     # Reddit 使用加速 LLM 配置（如果有的话，否则回退到通用配置）
     model = create_model(config, use_boost=True)
@@ -1506,82 +2218,86 @@ async def run_reddit_simulation(
     
     await result.env.reset()
     log_info("环境已启动")
-    
-    if action_logger:
-        action_logger.log_simulation_start(config)
-    
+
     total_actions = 0
     last_rowid = 0  # 跟踪数据库中最后处理的行号（使用 rowid 避免 created_at 格式差异）
-    
-    # 执行初始事件
-    event_config = config.get("event_config", {})
-    initial_posts = event_config.get("initial_posts", [])
-    
-    # 记录 round 0 开始（初始事件阶段）
-    if action_logger:
-        action_logger.log_round_start(0, 0)  # round 0, simulated_hour 0
-    
-    initial_action_count = 0
-    if initial_posts:
-        initial_actions = {}
-        for post in initial_posts:
-            agent_id = post.get("poster_agent_id", 0)
-            content = post.get("content", "")
-            try:
-                agent = result.env.agent_graph.get_agent(agent_id)
-                if agent in initial_actions:
-                    if not isinstance(initial_actions[agent], list):
-                        initial_actions[agent] = [initial_actions[agent]]
-                    initial_actions[agent].append(ManualAction(
-                        action_type=ActionType.CREATE_POST,
-                        action_args={"content": content}
-                    ))
-                else:
+    start_round_num = 0
+
+    if resume_plan and resume_plan.has_checkpoint:
+        total_actions = await replay_platform_state(
+            result.env,
+            resume_plan,
+            "Reddit",
+            log_info=log_info
+        )
+        last_rowid = get_last_trace_rowid(db_path)
+        start_round_num = resume_plan.last_completed_round
+        log_info(
+            f"恢复完成，将从第 {start_round_num + 1} 轮继续 "
+            f"(已恢复 {total_actions} 条动作)"
+        )
+    else:
+        if action_logger:
+            action_logger.log_simulation_start(config)
+
+        # 执行初始事件
+        event_config = config.get("event_config", {})
+        initial_posts = event_config.get("initial_posts", [])
+
+        # 记录 round 0 开始（初始事件阶段）
+        if action_logger:
+            action_logger.log_round_start(0, 0)  # round 0, simulated_hour 0
+
+        initial_action_count = 0
+        if initial_posts:
+            initial_actions = {}
+            for post in initial_posts:
+                agent_id = post.get("poster_agent_id", 0)
+                content = post.get("content", "")
+                try:
+                    agent = result.env.agent_graph.get_agent(agent_id)
                     initial_actions[agent] = ManualAction(
                         action_type=ActionType.CREATE_POST,
                         action_args={"content": content}
                     )
 
-                if action_logger:
-                    action_logger.log_action(
-                        round_num=0,
-                        agent_id=agent_id,
-                        agent_name=agent_names.get(agent_id, f"Agent_{agent_id}"),
-                        action_type="CREATE_POST",
-                        action_args={"content": content}
-                    )
-                    total_actions += 1
-                    initial_action_count += 1
-            except Exception as e:
-                logger.warning(f"创建Reddit初始帖子失败 (agent_id={agent_id}): {e}")
+                    if action_logger:
+                        action_logger.log_action(
+                            round_num=0,
+                            agent_id=agent_id,
+                            agent_name=agent_names.get(agent_id, f"Agent_{agent_id}"),
+                            action_type="CREATE_POST",
+                            action_args={"content": content}
+                        )
+                        total_actions += 1
+                        initial_action_count += 1
+                except Exception as e:
+                    logger.warning(f"创建Reddit初始帖子失败 (agent_id={agent_id}): {e}")
 
-        if initial_actions:
-            await env_step_with_timeout(
-                result.env, initial_actions,
-                step_description=f"Reddit initial posts ({len(initial_actions)} posts)"
-            )
-            log_info(f"已发布 {len(initial_actions)} 条初始帖子")
+            if initial_actions:
+                await env_step_with_timeout(
+                    result.env, initial_actions,
+                    step_description=f"Reddit initial posts ({len(initial_actions)} posts)"
+                )
+                log_info(f"已发布 {len(initial_actions)} 条初始帖子")
 
-    # 记录 round 0 结束
-    if action_logger:
-        action_logger.log_round_end(0, initial_action_count)
-    
-    # 主模拟循环
-    time_config = config.get("time_config", {})
-    total_hours = time_config.get("total_simulation_hours", 72)
-    minutes_per_round = time_config.get("minutes_per_round", 30)
-    total_rounds = (total_hours * 60) // minutes_per_round
-    
-    # 如果指定了最大轮数，则截断
-    if max_rounds is not None and max_rounds > 0:
-        original_rounds = total_rounds
-        total_rounds = min(total_rounds, max_rounds)
-        if total_rounds < original_rounds:
-            log_info(f"轮数已截断: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})")
+        # 记录 round 0 结束
+        if action_logger:
+            action_logger.log_round_end(0, initial_action_count)
+
+        if max_rounds is not None and max_rounds > 0:
+            config_total_rounds = _get_effective_total_rounds(config, None)
+            if total_rounds < config_total_rounds:
+                log_info(f"轮数已截断: {config_total_rounds} -> {total_rounds} (max_rounds={max_rounds})")
     
     start_time = datetime.now()
+
+    if start_round_num >= total_rounds:
+        result.total_actions = total_actions
+        log_info(f"恢复检查点已达到目标轮次 ({start_round_num}/{total_rounds})，无需继续模拟")
+        return result
     
-    for round_num in range(total_rounds):
+    for round_num in range(start_round_num, total_rounds):
         # 检查是否收到退出信号
         if _shutdown_event and _shutdown_event.is_set():
             if main_logger:
@@ -1607,10 +2323,16 @@ async def run_reddit_simulation(
             continue
         
         actions = {agent: LLMAction() for _, agent in active_agents}
-        await env_step_with_timeout(
-            result.env, actions,
-            step_description=f"Reddit round {round_num + 1} ({len(active_agents)} agents)"
-        )
+        try:
+            await env_step_with_timeout(
+                result.env, actions,
+                step_description=f"Reddit round {round_num + 1} ({len(active_agents)} agents)"
+            )
+        except (TimeoutError, Exception) as e:
+            log_info(f"Round {round_num + 1} 失败，跳过此轮: {e}")
+            if action_logger:
+                action_logger.log_round_end(round_num + 1, 0)
+            continue
 
         # 从数据库获取实际执行的动作并记录
         actual_actions, last_rowid = fetch_new_actions_from_db(
@@ -1674,6 +2396,12 @@ async def main():
         help='最大模拟轮数（可选，用于截断过长的模拟）'
     )
     parser.add_argument(
+        '--resume',
+        action='store_true',
+        default=False,
+        help='从最后一个有效 round_end 恢复模拟'
+    )
+    parser.add_argument(
         '--no-wait',
         action='store_true',
         default=False,
@@ -1695,10 +2423,10 @@ async def main():
     wait_for_commands = not args.no_wait
     
     # 初始化日志配置（禁用 OASIS 日志，清理旧文件）
-    init_logging_for_simulation(simulation_dir)
+    init_logging_for_simulation(simulation_dir, clear_old_logs=not args.resume)
     
     # 创建日志管理器
-    log_manager = SimulationLogManager(simulation_dir)
+    log_manager = SimulationLogManager(simulation_dir, append=args.resume)
     twitter_logger = log_manager.get_twitter_logger()
     reddit_logger = log_manager.get_reddit_logger()
     
@@ -1707,6 +2435,7 @@ async def main():
     log_manager.info(f"配置文件: {args.config}")
     log_manager.info(f"模拟ID: {config.get('simulation_id', 'unknown')}")
     log_manager.info(f"等待命令模式: {'启用' if wait_for_commands else '禁用'}")
+    log_manager.info(f"恢复模式: {'启用' if args.resume else '禁用'}")
     log_manager.info("=" * 60)
     
     time_config = config.get("time_config", {})
@@ -1729,6 +2458,14 @@ async def main():
     log_manager.info(f"  - Twitter动作: twitter/actions.jsonl")
     log_manager.info(f"  - Reddit动作: reddit/actions.jsonl")
     log_manager.info("=" * 60)
+
+    if args.resume:
+        effective_total_rounds = _get_effective_total_rounds(config, args.max_rounds)
+        _sanitize_resume_action_logs(
+            simulation_dir,
+            effective_total_rounds,
+            log_info=log_manager.info
+        )
     
     start_time = datetime.now()
     
@@ -1737,14 +2474,18 @@ async def main():
     reddit_result: Optional[PlatformSimulation] = None
     
     if args.twitter_only:
-        twitter_result = await run_twitter_simulation(config, simulation_dir, twitter_logger, log_manager, args.max_rounds)
+        twitter_result = await run_twitter_simulation(
+            config, simulation_dir, twitter_logger, log_manager, args.max_rounds, args.resume
+        )
     elif args.reddit_only:
-        reddit_result = await run_reddit_simulation(config, simulation_dir, reddit_logger, log_manager, args.max_rounds)
+        reddit_result = await run_reddit_simulation(
+            config, simulation_dir, reddit_logger, log_manager, args.max_rounds, args.resume
+        )
     else:
         # 并行运行（每个平台使用独立的日志记录器）
         results = await asyncio.gather(
-            run_twitter_simulation(config, simulation_dir, twitter_logger, log_manager, args.max_rounds),
-            run_reddit_simulation(config, simulation_dir, reddit_logger, log_manager, args.max_rounds),
+            run_twitter_simulation(config, simulation_dir, twitter_logger, log_manager, args.max_rounds, args.resume),
+            run_reddit_simulation(config, simulation_dir, reddit_logger, log_manager, args.max_rounds, args.resume),
         )
         twitter_result, reddit_result = results
     

@@ -21,7 +21,7 @@ export const prepareSimulation = (data) => {
  * @param {Object} data - { task_id?, simulation_id? }
  */
 export const getPrepareStatus = (data) => {
-  return service.post('/api/simulation/prepare/status', data)
+  return service.post('/api/simulation/prepare/status', data, { timeout: 15000 })
 }
 
 /**
@@ -78,7 +78,7 @@ export const listSimulations = (projectId) => {
 
 /**
  * 启动模拟
- * @param {Object} data - { simulation_id, platform?, max_rounds?, enable_graph_memory_update? }
+ * @param {Object} data - { simulation_id, platform?, max_rounds?, enable_graph_memory_update?, resume?, force? }
  */
 export const startSimulation = (data) => {
   return requestWithRetry(() => service.post('/api/simulation/start', data), 3, 1000)
@@ -89,7 +89,7 @@ export const startSimulation = (data) => {
  * @param {Object} data - { simulation_id }
  */
 export const stopSimulation = (data) => {
-  return service.post('/api/simulation/stop', data)
+  return requestWithRetry(() => service.post('/api/simulation/stop', data), 3, 1000)
 }
 
 /**
@@ -97,7 +97,7 @@ export const stopSimulation = (data) => {
  * @param {string} simulationId
  */
 export const getRunStatus = (simulationId) => {
-  return service.get(`/api/simulation/${simulationId}/run-status`)
+  return service.get(`/api/simulation/${simulationId}/run-status`, { timeout: 15000 })
 }
 
 /**
@@ -105,7 +105,7 @@ export const getRunStatus = (simulationId) => {
  * @param {string} simulationId
  */
 export const getRunStatusDetail = (simulationId) => {
-  return service.get(`/api/simulation/${simulationId}/run-status/detail`)
+  return service.get(`/api/simulation/${simulationId}/run-status/detail`, { timeout: 15000 })
 }
 
 /**
@@ -182,6 +182,5 @@ export const interviewAgents = (data) => {
  * @param {number} limit - 返回数量限制
  */
 export const getSimulationHistory = (limit = 20) => {
-  return service.get('/api/simulation/history', { params: { limit } })
+  return service.get('/api/simulation/history', { params: { limit }, timeout: 15000 })
 }
-

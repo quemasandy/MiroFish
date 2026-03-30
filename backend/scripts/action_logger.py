@@ -122,14 +122,16 @@ class SimulationLogManager:
     统一管理所有日志文件，按平台分离
     """
     
-    def __init__(self, simulation_dir: str):
+    def __init__(self, simulation_dir: str, append: bool = False):
         """
         初始化日志管理器
         
         Args:
             simulation_dir: 模拟目录路径
+            append: 是否追加写入主日志
         """
         self.simulation_dir = simulation_dir
+        self.append = append
         self.twitter_logger: Optional[PlatformActionLogger] = None
         self.reddit_logger: Optional[PlatformActionLogger] = None
         self._main_logger: Optional[logging.Logger] = None
@@ -147,7 +149,11 @@ class SimulationLogManager:
         self._main_logger.handlers.clear()
         
         # 文件处理器
-        file_handler = logging.FileHandler(log_path, encoding='utf-8', mode='w')
+        file_handler = logging.FileHandler(
+            log_path,
+            encoding='utf-8',
+            mode='a' if self.append else 'w'
+        )
         file_handler.setLevel(logging.INFO)
         file_handler.setFormatter(logging.Formatter(
             '%(asctime)s - %(levelname)s - %(message)s',

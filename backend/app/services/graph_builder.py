@@ -261,8 +261,9 @@ class GraphBuilderService:
 
         completed_count = 0
         
-        # 使用多线程加速LLM提取
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        # Use ThreadPool with limited workers to avoid starving Flask server
+        max_workers = 2 if threading.active_count() > 15 else 4
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             # 提交所有任务
             futures = []
             for i, chunk in enumerate(chunks):
@@ -283,8 +284,8 @@ class GraphBuilderService:
                 except Exception as e:
                     logger.error(f"处理实体提取时发生错误: {str(e)}")
                 
-                # 防抖，让出CPU给其他线程
-                time.sleep(0.05)
+                # Yield CPU to Flask request threads
+                time.sleep(0.1)
                 
         logger.info(f"共处理 {total_chunks} 个文本块, 写入 {len(episode_uuids)} 批数据")
         return episode_uuids

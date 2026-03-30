@@ -20,6 +20,7 @@ from openai import OpenAI
 
 from ..config import Config
 from ..utils.logger import get_logger
+from ..utils.llm_routing import resolve_llm_config
 from .zep_entity_reader import EntityNode, ZepEntityReader
 
 logger = get_logger('mirofish.simulation_config')
@@ -227,17 +228,18 @@ class SimulationConfigGenerator:
         base_url: Optional[str] = None,
         model_name: Optional[str] = None
     ):
-        self.api_key = api_key or Config.LLM_API_KEY
-        self.base_url = base_url or Config.LLM_BASE_URL
-        self.model_name = model_name or Config.LLM_MODEL_NAME
+        self._api_key_override = api_key
+        self._base_url_override = base_url
+        self._model_name_override = model_name
+        self._stage_clients: Dict[str, Any] = {}
+
+        runtime_config = self._get_stage_config("simulation_runtime")
+        self.api_key = runtime_config.api_key
+        self.base_url = runtime_config.base_url
+        self.model_name = runtime_config.model_name
         
         if not self.api_key:
             raise ValueError("LLM_API_KEY 未配置")
-        
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url=self.base_url
-        )
     
     def generate_config(
         self,
@@ -368,8 +370,8 @@ class SimulationConfigGenerator:
             event_config=event_config,
             twitter_config=twitter_config,
             reddit_config=reddit_config,
-            llm_model=self.model_name,
-            llm_base_url=self.base_url,
+            llm_model=self._get_stage_config("simulation_runtime").model_name,
+            llm_base_url=self._get_stage_config("simulation_runtime").base_url,
             generation_reasoning=" | ".join(reasoning_parts)
         )
         
@@ -430,17 +432,54 @@ class SimulationConfigGenerator:
         
         return "\n".join(lines)
     
-    def _call_llm_with_retry(self, prompt: str, system_prompt: str) -> Dict[str, Any]:
+    def _get_stage_config(self, stage: str):
+        """Resolve the LLM config for a specific simulation stage."""
+        return resolve_llm_config(
+            stage,
+            api_key=self._api_key_override,
+            base_url=self._base_url_override,
+            model_name=self._model_name_override,
+        )
+
+    def _get_stage_client(self, stage: str):
+        """Create and cache OpenAI clients per stage."""
+        if stage not in self._stage_clients:
+            config = self._get_stage_config(stage)
+            self._stage_clients[stage] = (
+                config,
+                OpenAI(
+                    api_key=config.api_key,
+                    base_url=config.base_url,
+                ),
+            )
+        return self._stage_clients[stage]
+
+    def _log_llm_request(self, stage: str, request_type: str):
+        """Log the resolved model for this request."""
+        config = self._get_stage_config(stage)
+        logger.info(
+            "[LLM_ROUTING] stage=%s route=%s profile=%s model=%s base_url=%s request=%s",
+            config.stage,
+            config.route,
+            config.profile,
+            config.model_name,
+            config.base_url,
+            request_type,
+        )
+
+    def _call_llm_with_retry(self, prompt: str, system_prompt: str, stage: str) -> Dict[str, Any]:
         """带重试的LLM调用，包含JSON修复逻辑"""
         import re
         
         max_attempts = 3
         last_error = None
+        config, client = self._get_stage_client(stage)
         
         for attempt in range(max_attempts):
             try:
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
+                self._log_llm_request(stage, "chat_json")
+                response = client.chat.completions.create(
+                    model=config.model_name,
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": prompt}
@@ -587,7 +626,7 @@ class SimulationConfigGenerator:
         system_prompt = "你是社交媒体模拟专家。返回纯JSON格式，时间配置需符合中国人作息习惯。"
         
         try:
-            return self._call_llm_with_retry(prompt, system_prompt)
+            return self._call_llm_with_retry(prompt, system_prompt, "sim_config_time_event")
         except Exception as e:
             logger.warning(f"时间配置LLM生成失败: {e}, 使用默认配置")
             return self._get_default_time_config(num_entities)
@@ -703,7 +742,7 @@ class SimulationConfigGenerator:
         system_prompt = "你是舆论分析专家。返回纯JSON格式。注意 poster_type 必须精确匹配可用实体类型。"
         
         try:
-            return self._call_llm_with_retry(prompt, system_prompt)
+            return self._call_llm_with_retry(prompt, system_prompt, "sim_config_time_event")
         except Exception as e:
             logger.warning(f"事件配置LLM生成失败: {e}, 使用默认配置")
             return {
@@ -866,7 +905,7 @@ class SimulationConfigGenerator:
         system_prompt = "你是社交媒体行为分析专家。返回纯JSON，配置需符合中国人作息习惯。"
         
         try:
-            result = self._call_llm_with_retry(prompt, system_prompt)
+            result = self._call_llm_with_retry(prompt, system_prompt, "sim_config_agent_batch")
             llm_configs = {cfg["agent_id"]: cfg for cfg in result.get("agent_configs", [])}
         except Exception as e:
             logger.warning(f"Agent配置批次LLM生成失败: {e}, 使用规则生成")
@@ -984,4 +1023,3 @@ class SimulationConfigGenerator:
                 "influence_weight": 1.0
             }
     
-

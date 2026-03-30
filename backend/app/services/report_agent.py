@@ -880,6 +880,10 @@ class ReportAgent:
     # 对话中的最大工具调用次数
     MAX_TOOL_CALLS_PER_CHAT = 2
     
+    # 单次工具结果回灌给章节LLM时的最大字符数。
+    # 原始结果仍会完整写入日志，只在后续推理上下文中截断，避免章节收尾阶段卡死。
+    PROMPT_OBSERVATION_MAX_CHARS = 8000
+    
     def __init__(
         self, 
         graph_id: str,
@@ -902,7 +906,17 @@ class ReportAgent:
         self.simulation_id = simulation_id
         self.simulation_requirement = simulation_requirement
         
-        self.llm = llm_client or LLMClient()
+        if llm_client is not None:
+            self.outline_llm = llm_client
+            self.section_llm = llm_client
+            self.chat_llm = llm_client
+        else:
+            self.outline_llm = LLMClient(stage="report_outline")
+            self.section_llm = LLMClient(stage="report_section")
+            self.chat_llm = LLMClient(stage="report_chat")
+
+        # Backward-compatible alias for section generation paths.
+        self.llm = self.section_llm
         self.zep_tools = zep_tools or ZepToolsService()
         
         # 工具定义
@@ -1132,6 +1146,35 @@ class ReportAgent:
             if params_desc:
                 desc_parts.append(f"  参数: {params_desc}")
         return "\n".join(desc_parts)
+
+    def _prepare_tool_result_for_prompt(self, tool_name: str, result: str) -> str:
+        """
+        将工具结果压缩到适合继续回灌给章节 LLM 的大小。
+
+        注意：
+        - 日志中仍保存完整工具结果，便于前端排查；
+        - 这里只裁剪下一轮 prompt，避免超长 observation 让强制收尾阶段挂起。
+        """
+        if not result:
+            return ""
+
+        text = result.strip()
+        if len(text) <= self.PROMPT_OBSERVATION_MAX_CHARS:
+            return text
+
+        head_budget = max(self.PROMPT_OBSERVATION_MAX_CHARS - 160, 1000)
+        truncated = text[:head_budget].rstrip()
+        logger.info(
+            "工具结果过长，截断后再送入章节LLM: tool=%s original_length=%s prompt_length=%s",
+            tool_name,
+            len(text),
+            len(truncated),
+        )
+        return (
+            f"{truncated}\n\n"
+            f"[系统备注：{tool_name} 原始结果过长，已截断为前 {len(truncated)} / {len(text)} 字符，"
+            "完整内容仍保存在日志中。]"
+        )
     
     def plan_outline(
         self, 
@@ -1173,7 +1216,7 @@ class ReportAgent:
         )
 
         try:
-            response = self.llm.chat_json(
+            response = self.outline_llm.chat_json(
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
@@ -1446,6 +1489,7 @@ class ReportAgent:
 
                 tool_calls_count += 1
                 used_tools.add(call['name'])
+                prompt_result = self._prepare_tool_result_for_prompt(call["name"], result)
 
                 # 构建未使用工具提示
                 unused_tools = all_tools - used_tools
@@ -1458,7 +1502,7 @@ class ReportAgent:
                     "role": "user",
                     "content": REACT_OBSERVATION_TEMPLATE.format(
                         tool_name=call["name"],
-                        result=result,
+                        result=prompt_result,
                         tool_calls_count=tool_calls_count,
                         max_tool_calls=self.MAX_TOOL_CALLS_PER_SECTION,
                         used_tools_str=", ".join(used_tools),
@@ -1597,6 +1641,7 @@ class ReportAgent:
             
             # 阶段1: 规划大纲
             report.status = ReportStatus.PLANNING
+            ReportManager.save_report(report)
             ReportManager.update_progress(
                 report_id, "planning", 5, "开始规划报告大纲...",
                 completed_sections=[]
@@ -1629,6 +1674,7 @@ class ReportAgent:
             
             # 阶段2: 逐章节生成（分章节保存）
             report.status = ReportStatus.GENERATING
+            ReportManager.save_report(report)
             
             total_sections = len(outline.sections)
             generated_sections = []  # 保存内容用于上下文
@@ -1672,6 +1718,7 @@ class ReportAgent:
                 # 保存章节
                 ReportManager.save_section(report_id, section_num, section)
                 completed_section_titles.append(section.title)
+                ReportManager.save_report(report)
 
                 # 记录章节完成日志
                 full_section_content = f"## {section.title}\n\n{section_content}"
@@ -1824,7 +1871,7 @@ class ReportAgent:
         max_iterations = 2  # 减少迭代轮数
         
         for iteration in range(max_iterations):
-            response = self.llm.chat(
+            response = self.chat_llm.chat(
                 messages=messages,
                 temperature=0.5
             )
@@ -1864,7 +1911,7 @@ class ReportAgent:
             })
         
         # 达到最大迭代，获取最终响应
-        final_response = self.llm.chat(
+        final_response = self.chat_llm.chat(
             messages=messages,
             temperature=0.5
         )

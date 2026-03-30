@@ -116,11 +116,33 @@ cp .env.example .env
 
 ```env
 # LLM API配置（支持 OpenAI SDK 格式的任意 LLM API）
+# 方案 A：官方 OpenAI API
+# 注意：ChatGPT Plus 与 API 计费分离，Plus 订阅不包含 API 额度
+# 如需使用官方 OpenAI API，请先在 https://platform.openai.com/ 开通 API 计费
+# LLM_API_KEY=sk-...
+# LLM_BASE_URL=https://api.openai.com/v1
+# LLM_MODEL_NAME=gpt-4o-mini
+#
+# 也可直接使用 OpenAI 常见变量名：
+# OPENAI_API_KEY=sk-...
+# OPENAI_BASE_URL=https://api.openai.com/v1
+# OPENAI_MODEL_NAME=gpt-4o-mini
+#
+# 方案 B：其他 OpenAI-compatible provider
 # 推荐使用阿里百炼平台qwen-plus模型：https://bailian.console.aliyun.com/
 # 注意消耗较大，可先进行小于40轮的模拟尝试
 LLM_API_KEY=your_api_key
 LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 LLM_MODEL_NAME=qwen-plus
+
+# 可选：混合模型路由（基础模型 + Premium模型）
+# 如果 Premium 和基础模型走同一个 provider，可以只设置 LLM_PREMIUM_MODEL_NAME
+# 不设置 Premium 时，会自动全部回退到基础模型
+LLM_PREMIUM_API_KEY=
+LLM_PREMIUM_BASE_URL=
+LLM_PREMIUM_MODEL_NAME=anthropic/claude-sonnet-4.6
+# 可选值：conservative | balanced | max_quality
+LLM_ROUTING_PROFILE=balanced
 
 # Zep Cloud 配置
 # 每月免费额度即可支撑简单使用：https://app.getzep.com/

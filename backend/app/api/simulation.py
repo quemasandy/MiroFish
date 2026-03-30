@@ -962,7 +962,7 @@ def get_simulation_history():
             try:
                 created_date = sim_dict.get("created_at", "")[:10]
                 sim_dict["created_date"] = created_date
-            except:
+            except Exception:
                 sim_dict["created_date"] = ""
             
             enriched_simulations.append(sim_dict)
@@ -1454,6 +1454,7 @@ def start_simulation():
             "platform": "parallel",                // 可选: twitter / reddit / parallel (默认)
             "max_rounds": 100,                     // 可选: 最大模拟轮数，用于截断过长的模拟
             "enable_graph_memory_update": false,   // 可选: 是否将Agent活动动态更新到Zep图谱记忆
+            "resume": false,                       // 可选: 从最后一个有效 round_end 恢复
             "force": false                         // 可选: 强制重新开始（会停止运行中的模拟并清理日志）
         }
 
@@ -1462,6 +1463,12 @@ def start_simulation():
         - 清理的内容包括：run_state.json, actions.jsonl, simulation.log 等
         - 不会清理配置文件（simulation_config.json）和 profile 文件
         - 适用于需要重新运行模拟的场景
+
+    关于 resume 参数：
+        - 仅支持 parallel 模式
+        - 会从 actions.jsonl 中最后一个有效 round_end 恢复
+        - 会保留既有动作日志和模拟数据库，不会从零开始
+        - 如果存在历史痕迹但没有可恢复检查点，会返回错误，要求使用 force=true
 
     关于 enable_graph_memory_update：
         - 启用后，模拟中所有Agent的活动（发帖、评论、点赞等）都会实时更新到Zep图谱
@@ -1497,7 +1504,14 @@ def start_simulation():
         platform = data.get('platform', 'parallel')
         max_rounds = data.get('max_rounds')  # 可选：最大模拟轮数
         enable_graph_memory_update = data.get('enable_graph_memory_update', False)  # 可选：是否启用图谱记忆更新
+        resume = data.get('resume', False)  # 可选：是否从有效检查点恢复
         force = data.get('force', False)  # 可选：强制重新开始
+
+        if force and resume:
+            return jsonify({
+                "success": False,
+                "error": "force 和 resume 不能同时为 true"
+            }), 400
 
         # 验证 max_rounds 参数
         if max_rounds is not None:
@@ -1564,6 +1578,18 @@ def start_simulation():
                     if not cleanup_result.get("success"):
                         logger.warning(f"清理日志时出现警告: {cleanup_result.get('errors')}")
                     force_restarted = True
+                elif resume:
+                    logger.info(f"恢复模式：保留历史运行数据 {simulation_id}")
+                else:
+                    resume_checkpoint = SimulationRunner.get_resume_checkpoint(
+                        simulation_id,
+                        max_rounds if max_rounds is not None else 0
+                    )
+                    if resume_checkpoint.get("has_artifacts"):
+                        return jsonify({
+                            "success": False,
+                            "error": "检测到历史运行数据。请使用 resume=true 继续，或使用 force=true 从头重新开始"
+                        }), 400
 
                 # 进程不存在或已结束，重置状态为 ready
                 logger.info(f"模拟 {simulation_id} 准备工作已完成，重置状态为 ready（原状态: {state.status.value}）")
@@ -1601,7 +1627,8 @@ def start_simulation():
             platform=platform,
             max_rounds=max_rounds,
             enable_graph_memory_update=enable_graph_memory_update,
-            graph_id=graph_id
+            graph_id=graph_id,
+            resume=resume
         )
         
         # 更新模拟状态
@@ -1613,6 +1640,8 @@ def start_simulation():
             response_data['max_rounds_applied'] = max_rounds
         response_data['graph_memory_update_enabled'] = enable_graph_memory_update
         response_data['force_restarted'] = force_restarted
+        response_data['resume_requested'] = resume
+        response_data['resume_applied'] = run_state.resume_mode
         if enable_graph_memory_update:
             response_data['graph_id'] = graph_id
         
@@ -1672,7 +1701,11 @@ def stop_simulation():
         manager = SimulationManager()
         state = manager.get_simulation(simulation_id)
         if state:
-            state.status = SimulationStatus.PAUSED
+            state.status = SimulationStatus.STOPPED
+            state.current_round = run_state.current_round
+            state.twitter_status = "stopped"
+            state.reddit_status = "stopped"
+            state.error = None
             manager._save_simulation_state(state)
         
         return jsonify({

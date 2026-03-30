@@ -142,6 +142,12 @@ class SimulationRunState:
     
     # 进程ID（用于停止）
     process_pid: Optional[int] = None
+
+    # 恢复运行信息
+    resume_mode: bool = False
+    resume_from_round: int = 0
+    twitter_resume_from_round: int = 0
+    reddit_resume_from_round: int = 0
     
     def add_action(self, action: AgentAction):
         """添加动作到最近动作列表"""
@@ -182,6 +188,10 @@ class SimulationRunState:
             "completed_at": self.completed_at,
             "error": self.error,
             "process_pid": self.process_pid,
+            "resume_mode": self.resume_mode,
+            "resume_from_round": self.resume_from_round,
+            "twitter_resume_from_round": self.twitter_resume_from_round,
+            "reddit_resume_from_round": self.reddit_resume_from_round,
         }
     
     def to_detail_dict(self) -> Dict[str, Any]:
@@ -216,6 +226,7 @@ class SimulationRunner:
     )
     
     # 内存中的运行状态
+    _state_lock = threading.Lock()
     _run_states: Dict[str, SimulationRunState] = {}
     _processes: Dict[str, subprocess.Popen] = {}
     _action_queues: Dict[str, Queue] = {}
@@ -229,14 +240,14 @@ class SimulationRunner:
     @classmethod
     def get_run_state(cls, simulation_id: str) -> Optional[SimulationRunState]:
         """获取运行状态"""
-        if simulation_id in cls._run_states:
-            return cls._run_states[simulation_id]
-        
-        # 尝试从文件加载
-        state = cls._load_run_state(simulation_id)
-        if state:
-            cls._run_states[simulation_id] = state
-        return state
+        with cls._state_lock:
+            if simulation_id in cls._run_states:
+                return cls._run_states[simulation_id]
+
+            state = cls._load_run_state(simulation_id)
+            if state:
+                cls._run_states[simulation_id] = state
+            return state
     
     @classmethod
     def _load_run_state(cls, simulation_id: str) -> Optional[SimulationRunState]:
@@ -246,9 +257,11 @@ class SimulationRunner:
             return None
         
         try:
+            # Leer todo el contenido primero para evitar lecturas parciales
             with open(state_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
+                content = f.read()
+            data = json.loads(content)
+
             state = SimulationRunState(
                 simulation_id=simulation_id,
                 runner_status=RunnerStatus(data.get("runner_status", "idle")),
@@ -272,6 +285,10 @@ class SimulationRunner:
                 completed_at=data.get("completed_at"),
                 error=data.get("error"),
                 process_pid=data.get("process_pid"),
+                resume_mode=data.get("resume_mode", False),
+                resume_from_round=data.get("resume_from_round", 0),
+                twitter_resume_from_round=data.get("twitter_resume_from_round", 0),
+                reddit_resume_from_round=data.get("reddit_resume_from_round", 0),
             )
             
             # 加载最近动作
@@ -296,17 +313,171 @@ class SimulationRunner:
     
     @classmethod
     def _save_run_state(cls, state: SimulationRunState):
-        """保存运行状态到文件"""
+        """保存运行状态到文件（原子写入，避免读取到部分写入的JSON）"""
+        with cls._state_lock:
+            sim_dir = os.path.join(cls.RUN_STATE_DIR, state.simulation_id)
+            os.makedirs(sim_dir, exist_ok=True)
+            state_file = os.path.join(sim_dir, "run_state.json")
+            tmp_file = state_file + ".tmp"
+
+            data = state.to_detail_dict()
+
+            with open(tmp_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_file, state_file)
+
+            cls._run_states[state.simulation_id] = state
+
+    @classmethod
+    def _read_completed_rounds_from_log(
+        cls,
+        log_path: str,
+        total_rounds: int = 0
+    ) -> Dict[str, Any]:
+        """
+        读取单个平台动作日志中可恢复的完整轮次和动作数。
+
+        只信任 round_end 事件；未完成轮次的动作不会计入恢复基线。
+        """
+        result = {
+            "artifacts_found": os.path.exists(log_path) and os.path.getsize(log_path) > 0,
+            "completed_rounds": [],
+            "last_completed_round": 0,
+            "replayable_actions_count": 0,
+        }
+
+        if not os.path.exists(log_path):
+            return result
+
+        action_counts: Dict[int, int] = {}
+        completed_rounds = set()
+
+        try:
+            with open(log_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    round_num = data.get("round")
+                    if not isinstance(round_num, int) or round_num < 0:
+                        continue
+                    if total_rounds > 0 and round_num > total_rounds:
+                        continue
+
+                    if data.get("event_type") == "round_end":
+                        completed_rounds.add(round_num)
+                    elif "event_type" not in data:
+                        action_counts[round_num] = action_counts.get(round_num, 0) + 1
+        except OSError as e:
+            logger.warning(f"读取恢复轮次失败: {log_path}, error={e}")
+            return result
+
+        ordered_rounds = sorted(completed_rounds)
+        result["completed_rounds"] = ordered_rounds
+        result["last_completed_round"] = ordered_rounds[-1] if ordered_rounds else 0
+        result["replayable_actions_count"] = sum(
+            action_counts.get(round_num, 0) for round_num in ordered_rounds
+        )
+        return result
+
+    @classmethod
+    def get_resume_checkpoint(
+        cls,
+        simulation_id: str,
+        total_rounds: int = 0
+    ) -> Dict[str, Any]:
+        """获取模拟的可恢复检查点。"""
+        sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
+        twitter_log = os.path.join(sim_dir, "twitter", "actions.jsonl")
+        reddit_log = os.path.join(sim_dir, "reddit", "actions.jsonl")
+
+        twitter = cls._read_completed_rounds_from_log(twitter_log, total_rounds)
+        reddit = cls._read_completed_rounds_from_log(reddit_log, total_rounds)
+
+        return {
+            "twitter": twitter,
+            "reddit": reddit,
+            "has_checkpoint": bool(
+                twitter["completed_rounds"] or reddit["completed_rounds"]
+            ),
+            "has_artifacts": bool(
+                twitter["artifacts_found"] or reddit["artifacts_found"]
+            ),
+            "current_round": max(
+                twitter["last_completed_round"],
+                reddit["last_completed_round"],
+            ),
+            "twitter_current_round": twitter["last_completed_round"],
+            "reddit_current_round": reddit["last_completed_round"],
+            "twitter_actions_count": twitter["replayable_actions_count"],
+            "reddit_actions_count": reddit["replayable_actions_count"],
+        }
+
+    @classmethod
+    def _recompute_progress_from_logs(cls, state: SimulationRunState):
+        """
+        从 actions.jsonl 的 round_end 事件重新计算已完成轮次。
+
+        手动停止或异常退出时，日志中可能存在超出 total_rounds 的残留 round 事件。
+        这里只信任 round_end，且忽略超过 total_rounds 的轮次，避免进度超过 100%。
+        """
         sim_dir = os.path.join(cls.RUN_STATE_DIR, state.simulation_id)
-        os.makedirs(sim_dir, exist_ok=True)
-        state_file = os.path.join(sim_dir, "run_state.json")
-        
-        data = state.to_detail_dict()
-        
-        with open(state_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        
-        cls._run_states[state.simulation_id] = state
+
+        twitter_log = os.path.join(sim_dir, "twitter", "actions.jsonl")
+        reddit_log = os.path.join(sim_dir, "reddit", "actions.jsonl")
+
+        twitter = cls._read_completed_rounds_from_log(twitter_log, state.total_rounds)
+        reddit = cls._read_completed_rounds_from_log(reddit_log, state.total_rounds)
+
+        state.twitter_current_round = twitter["last_completed_round"]
+        state.reddit_current_round = reddit["last_completed_round"]
+        state.current_round = max(state.twitter_current_round, state.reddit_current_round)
+
+    @classmethod
+    def _update_simulation_state_file(
+        cls,
+        simulation_id: str,
+        *,
+        status: str,
+        current_round: Optional[int] = None,
+        twitter_status: Optional[str] = None,
+        reddit_status: Optional[str] = None,
+        error: Optional[str] = None,
+    ):
+        """同步更新 simulation 目录中的 state.json。"""
+        sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
+        state_file = os.path.join(sim_dir, "state.json")
+
+        if not os.path.exists(state_file):
+            return
+
+        try:
+            with open(state_file, 'r', encoding='utf-8') as f:
+                state_data = json.load(f)
+
+            state_data["status"] = status
+            state_data["updated_at"] = datetime.now().isoformat()
+
+            if current_round is not None:
+                state_data["current_round"] = current_round
+            if twitter_status is not None:
+                state_data["twitter_status"] = twitter_status
+            if reddit_status is not None:
+                state_data["reddit_status"] = reddit_status
+
+            # 手动停止不是错误；传入非 None 时才写入错误信息。
+            state_data["error"] = error
+
+            with open(state_file, 'w', encoding='utf-8') as f:
+                json.dump(state_data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"更新 state.json 失败: {simulation_id}, error={e}")
     
     @classmethod
     def start_simulation(
@@ -315,7 +486,8 @@ class SimulationRunner:
         platform: str = "parallel",  # twitter / reddit / parallel
         max_rounds: int = None,  # 最大模拟轮数（可选，用于截断过长的模拟）
         enable_graph_memory_update: bool = False,  # 是否将活动更新到Zep图谱
-        graph_id: str = None  # Zep图谱ID（启用图谱更新时必需）
+        graph_id: str = None,  # Zep图谱ID（启用图谱更新时必需）
+        resume: bool = False,  # 是否从最后一个有效 round_end 恢复
     ) -> SimulationRunState:
         """
         启动模拟
@@ -326,6 +498,7 @@ class SimulationRunner:
             max_rounds: 最大模拟轮数（可选，用于截断过长的模拟）
             enable_graph_memory_update: 是否将Agent活动动态更新到Zep图谱
             graph_id: Zep图谱ID（启用图谱更新时必需）
+            resume: 是否从上次有效进度恢复
             
         Returns:
             SimulationRunState
@@ -357,13 +530,30 @@ class SimulationRunner:
             total_rounds = min(total_rounds, max_rounds)
             if total_rounds < original_rounds:
                 logger.info(f"轮数已截断: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})")
-        
+
+        if resume and platform != "parallel":
+            raise ValueError("当前仅支持 parallel 模式的 resume")
+
+        resume_checkpoint = cls.get_resume_checkpoint(simulation_id, total_rounds) if resume else None
+        resume_applied = bool(resume_checkpoint and resume_checkpoint["has_checkpoint"])
+        if resume and not resume_applied and resume_checkpoint and resume_checkpoint["has_artifacts"]:
+            raise ValueError("检测到历史运行痕迹，但没有可恢复的完整轮次；请使用 force=true 从头重新开始")
+
         state = SimulationRunState(
             simulation_id=simulation_id,
             runner_status=RunnerStatus.STARTING,
+            current_round=resume_checkpoint["current_round"] if resume_applied else 0,
             total_rounds=total_rounds,
             total_simulation_hours=total_hours,
+            twitter_current_round=resume_checkpoint["twitter_current_round"] if resume_applied else 0,
+            reddit_current_round=resume_checkpoint["reddit_current_round"] if resume_applied else 0,
+            twitter_actions_count=resume_checkpoint["twitter_actions_count"] if resume_applied else 0,
+            reddit_actions_count=resume_checkpoint["reddit_actions_count"] if resume_applied else 0,
             started_at=datetime.now().isoformat(),
+            resume_mode=resume_applied,
+            resume_from_round=resume_checkpoint["current_round"] if resume_applied else 0,
+            twitter_resume_from_round=resume_checkpoint["twitter_current_round"] if resume_applied else 0,
+            reddit_resume_from_round=resume_checkpoint["reddit_current_round"] if resume_applied else 0,
         )
         
         cls._save_run_state(state)
@@ -421,10 +611,17 @@ class SimulationRunner:
             # 如果指定了最大轮数，添加到命令行参数
             if max_rounds is not None and max_rounds > 0:
                 cmd.extend(["--max-rounds", str(max_rounds)])
+
+            if resume_applied:
+                cmd.append("--resume")
             
             # 创建主日志文件，避免 stdout/stderr 管道缓冲区满导致进程阻塞
             main_log_path = os.path.join(sim_dir, "simulation.log")
-            main_log_file = open(main_log_path, 'w', encoding='utf-8')
+            main_log_file = open(
+                main_log_path,
+                'a' if resume_applied else 'w',
+                encoding='utf-8'
+            )
             
             # 设置子进程环境变量，确保 Windows 上使用 UTF-8 编码
             # 这可以修复第三方库（如 OASIS）读取文件时未指定编码的问题
@@ -467,6 +664,9 @@ class SimulationRunner:
             logger.info(f"模拟启动成功: {simulation_id}, pid={process.pid}, platform={platform}")
             
         except Exception as e:
+            # Close leaked file handle if Popen failed after open()
+            if simulation_id not in cls._stdout_files and 'main_log_file' in locals():
+                main_log_file.close()
             state.runner_status = RunnerStatus.FAILED
             state.error = str(e)
             cls._save_run_state(state)
@@ -489,8 +689,12 @@ class SimulationRunner:
         if not process or not state:
             return
         
-        twitter_position = 0
-        reddit_position = 0
+        if state.resume_mode:
+            twitter_position = os.path.getsize(twitter_actions_log) if os.path.exists(twitter_actions_log) else 0
+            reddit_position = os.path.getsize(reddit_actions_log) if os.path.exists(reddit_actions_log) else 0
+        else:
+            twitter_position = 0
+            reddit_position = 0
         
         try:
             while process.poll() is None:  # 进程仍在运行
@@ -510,18 +714,41 @@ class SimulationRunner:
                 cls._save_run_state(state)
                 time.sleep(2)
             
-            # 进程结束后，最后读取一次日志
-            if os.path.exists(twitter_actions_log):
-                cls._read_action_log(twitter_actions_log, twitter_position, state, "twitter")
-            if os.path.exists(reddit_actions_log):
-                cls._read_action_log(reddit_actions_log, reddit_position, state, "reddit")
+            # Wait for file buffers to flush after process exit, then drain logs
+            time.sleep(0.5)
+            for _ in range(3):
+                changed = False
+                if os.path.exists(twitter_actions_log):
+                    new_pos = cls._read_action_log(twitter_actions_log, twitter_position, state, "twitter")
+                    if new_pos != twitter_position:
+                        twitter_position = new_pos
+                        changed = True
+                if os.path.exists(reddit_actions_log):
+                    new_pos = cls._read_action_log(reddit_actions_log, reddit_position, state, "reddit")
+                    if new_pos != reddit_position:
+                        reddit_position = new_pos
+                        changed = True
+                if not changed:
+                    break
+                time.sleep(0.2)
             
             # 进程结束
             exit_code = process.returncode
+            manual_stop = state.runner_status in [RunnerStatus.STOPPING, RunnerStatus.STOPPED]
             
-            if exit_code == 0:
+            if manual_stop:
+                cls._recompute_progress_from_logs(state)
+                state.runner_status = RunnerStatus.STOPPED
+                state.completed_at = state.completed_at or datetime.now().isoformat()
+                state.error = None
+                logger.info(f"模拟已手动停止: {simulation_id}")
+            elif exit_code == 0:
+                cls._recompute_progress_from_logs(state)
+                state.twitter_completed = state.twitter_current_round >= state.total_rounds
+                state.reddit_completed = state.reddit_current_round >= state.total_rounds
                 state.runner_status = RunnerStatus.COMPLETED
                 state.completed_at = datetime.now().isoformat()
+                state.error = None
                 logger.info(f"模拟完成: {simulation_id}")
             else:
                 state.runner_status = RunnerStatus.FAILED
@@ -540,7 +767,35 @@ class SimulationRunner:
             state.twitter_running = False
             state.reddit_running = False
             cls._save_run_state(state)
-            
+
+            # Sync completion status to SimulationManager's state.json
+            try:
+                from .simulation_manager import SimulationManager, SimulationStatus
+                manager = SimulationManager()
+                sim_state = manager.get_simulation(simulation_id)
+                if sim_state:
+                    if manual_stop:
+                        sim_state.status = SimulationStatus.STOPPED
+                        sim_state.current_round = state.current_round
+                        sim_state.twitter_status = "stopped"
+                        sim_state.reddit_status = "stopped"
+                        sim_state.error = None
+                    elif exit_code == 0:
+                        sim_state.status = SimulationStatus.COMPLETED
+                        sim_state.current_round = state.current_round
+                        sim_state.twitter_status = "completed"
+                        sim_state.reddit_status = "completed"
+                        sim_state.error = None
+                    else:
+                        sim_state.status = SimulationStatus.FAILED
+                        sim_state.current_round = state.current_round
+                        sim_state.twitter_status = "stopped"
+                        sim_state.reddit_status = "stopped"
+                        sim_state.error = state.error
+                    manager._save_simulation_state(sim_state)
+            except Exception as sync_err:
+                logger.warning(f"Failed to sync state.json: {sync_err}")
+
         except Exception as e:
             logger.error(f"监控线程异常: {simulation_id}, error={str(e)}")
             state.runner_status = RunnerStatus.FAILED
@@ -613,9 +868,40 @@ class SimulationRunner:
                             # 处理事件类型的条目
                             if "event_type" in action_data:
                                 event_type = action_data.get("event_type")
+                                round_num = action_data.get("round")
+
+                                if (
+                                    isinstance(round_num, int)
+                                    and state.total_rounds > 0
+                                    and round_num > state.total_rounds
+                                ):
+                                    logger.warning(
+                                        "忽略超出目标轮数的日志事件: simulation_id=%s, platform=%s, event=%s, round=%s, total_rounds=%s",
+                                        state.simulation_id,
+                                        platform,
+                                        event_type,
+                                        round_num,
+                                        state.total_rounds,
+                                    )
+                                    continue
                                 
                                 # 检测 simulation_end 事件，标记平台已完成
                                 if event_type == "simulation_end":
+                                    logged_total_rounds = action_data.get("total_rounds")
+                                    if (
+                                        isinstance(logged_total_rounds, int)
+                                        and state.total_rounds > 0
+                                        and logged_total_rounds > state.total_rounds
+                                    ):
+                                        logger.warning(
+                                            "忽略超出目标轮数的 simulation_end: simulation_id=%s, platform=%s, logged_total_rounds=%s, total_rounds=%s",
+                                            state.simulation_id,
+                                            platform,
+                                            logged_total_rounds,
+                                            state.total_rounds,
+                                        )
+                                        continue
+
                                     if platform == "twitter":
                                         state.twitter_completed = True
                                         state.twitter_running = False
@@ -636,7 +922,6 @@ class SimulationRunner:
                                 
                                 # 更新轮次信息（从 round_end 事件）
                                 elif event_type == "round_end":
-                                    round_num = action_data.get("round", 0)
                                     simulated_hours = action_data.get("simulated_hours", 0)
                                     
                                     # 更新各平台独立的轮次和时间
@@ -668,6 +953,21 @@ class SimulationRunner:
                                 result=action_data.get("result"),
                                 success=action_data.get("success", True),
                             )
+
+                            if (
+                                action.round_num
+                                and state.total_rounds > 0
+                                and action.round_num > state.total_rounds
+                            ):
+                                logger.warning(
+                                    "忽略超出目标轮数的动作: simulation_id=%s, platform=%s, round=%s, total_rounds=%s",
+                                    state.simulation_id,
+                                    platform,
+                                    action.round_num,
+                                    state.total_rounds,
+                                )
+                                continue
+
                             state.add_action(action)
                             
                             # 更新轮次
@@ -723,11 +1023,8 @@ class SimulationRunner:
             timeout: 等待进程退出的超时时间（秒）
         """
         if IS_WINDOWS:
-            # Windows: 使用 taskkill 命令终止进程树
-            # /F = 强制终止, /T = 终止进程树（包括子进程）
             logger.info(f"终止进程树 (Windows): simulation={simulation_id}, pid={process.pid}")
             try:
-                # 先尝试优雅终止
                 subprocess.run(
                     ['taskkill', '/PID', str(process.pid), '/T'],
                     capture_output=True,
@@ -736,14 +1033,18 @@ class SimulationRunner:
                 try:
                     process.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
-                    # 强制终止
                     logger.warning(f"进程未响应，强制终止: {simulation_id}")
                     subprocess.run(
                         ['taskkill', '/F', '/PID', str(process.pid), '/T'],
                         capture_output=True,
                         timeout=5
                     )
-                    process.wait(timeout=5)
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        logger.error(f"进程仍未退出，尝试 kill: {simulation_id}")
+                        process.kill()
+                        process.wait(timeout=3)
             except Exception as e:
                 logger.warning(f"taskkill 失败，尝试 terminate: {e}")
                 process.terminate()
@@ -751,6 +1052,10 @@ class SimulationRunner:
                     process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     process.kill()
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        logger.error(f"无法终止进程: {simulation_id}, pid={process.pid}")
         else:
             # Unix: 使用进程组终止
             # 由于使用了 start_new_session=True，进程组 ID 等于主进程 PID
@@ -799,10 +1104,20 @@ class SimulationRunner:
                     process.kill()
         
         state.runner_status = RunnerStatus.STOPPED
+        cls._recompute_progress_from_logs(state)
         state.twitter_running = False
         state.reddit_running = False
         state.completed_at = datetime.now().isoformat()
+        state.error = None
         cls._save_run_state(state)
+        cls._update_simulation_state_file(
+            simulation_id,
+            status="stopped",
+            current_round=state.current_round,
+            twitter_status="stopped",
+            reddit_status="stopped",
+            error=None,
+        )
         
         # 停止图谱记忆更新器
         if cls._graph_memory_enabled.get(simulation_id, False):
@@ -1760,4 +2075,3 @@ class SimulationRunner:
             results = results[:limit]
         
         return results
-

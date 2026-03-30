@@ -59,7 +59,7 @@ class LLMEntityExtractor:
     """
     
     def __init__(self, llm_client: Optional[LLMClient] = None):
-        self.llm_client = llm_client or LLMClient()
+        self.llm_client = llm_client or LLMClient(stage="graph_extraction")
     
     def extract(
         self,
