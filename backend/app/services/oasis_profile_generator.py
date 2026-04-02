@@ -21,6 +21,11 @@ from openai import OpenAI
 from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.llm_routing import resolve_llm_config
+from ..utils.project_brief import (
+    build_project_brief_context,
+    infer_country_label,
+    normalize_project_brief,
+)
 from .zep_entity_reader import EntityNode, EntityReader
 
 logger = get_logger('mirofish.oasis_profile')
@@ -162,20 +167,22 @@ class OasisProfileGenerator:
     
     # 常见国家列表
     COUNTRIES = [
-        "China", "US", "UK", "Japan", "Germany", "France", 
-        "Canada", "Australia", "Brazil", "India", "South Korea"
+        "中国", "美国", "英国", "日本", "德国", "法国",
+        "加拿大", "澳大利亚", "巴西", "印度", "韩国"
     ]
     
     # 个人类型实体（需要生成具体人设）
     INDIVIDUAL_ENTITY_TYPES = [
-        "student", "alumni", "professor", "person", "publicfigure", 
-        "expert", "faculty", "official", "journalist", "activist"
+        "student", "alumni", "professor", "person", "publicfigure",
+        "expert", "faculty", "official", "journalist", "activist",
+        "candidate", "politician", "voter", "communityleader"
     ]
     
     # 群体/机构类型实体（需要生成群体代表人设）
     GROUP_ENTITY_TYPES = [
-        "university", "governmentagency", "organization", "ngo", 
-        "mediaoutlet", "company", "institution", "group", "community"
+        "university", "governmentagency", "organization", "ngo",
+        "mediaoutlet", "company", "institution", "group", "community",
+        "politicalparty", "campaign", "movement", "neighborhood"
     ]
     
     def __init__(
@@ -184,7 +191,8 @@ class OasisProfileGenerator:
         base_url: Optional[str] = None,
         model_name: Optional[str] = None,
         zep_api_key: Optional[str] = None,
-        graph_id: Optional[str] = None
+        graph_id: Optional[str] = None,
+        project_brief: Optional[Dict[str, Any]] = None,
     ):
         self.llm_config = resolve_llm_config(
             "profile_generation",
@@ -214,6 +222,9 @@ class OasisProfileGenerator:
         # Neo4j客户端用于检索丰富上下文
         self.graph_id = graph_id
         self.entity_reader = EntityReader() if graph_id else None
+        self.project_brief = normalize_project_brief(project_brief)
+        self.country_hint = infer_country_label(self.project_brief)
+        self.project_brief_context = build_project_brief_context(self.project_brief)
 
     def _log_llm_request(self, request_type: str):
         """Log the resolved model for this stage."""
@@ -226,6 +237,18 @@ class OasisProfileGenerator:
             self.llm_config.base_url,
             request_type,
         )
+
+    def _get_country_hint(self, for_prompt: bool = False) -> str:
+        """Return a localized country hint for personas."""
+        if self.country_hint and self.country_hint != "本地":
+            return self.country_hint
+        return "当地国家" if for_prompt else "本地"
+
+    def _get_project_brief_block(self) -> str:
+        """Render project brief context for persona prompts."""
+        if not self.project_brief_context:
+            return ""
+        return f"\n项目简报:\n{self.project_brief_context}\n"
     
     def generate_profile_from_entity(
         self, 
@@ -632,6 +655,8 @@ class OasisProfileGenerator:
         
         attrs_str = json.dumps(entity_attributes, ensure_ascii=False) if entity_attributes else "无"
         context_str = context[:3000] if context else "无额外上下文"
+        project_brief_block = self._get_project_brief_block()
+        country_hint = self._get_country_hint(for_prompt=True)
         
         return f"""为实体生成详细的社交媒体用户人设,最大程度还原已有现实情况。
 
@@ -639,6 +664,7 @@ class OasisProfileGenerator:
 实体类型: {entity_type}
 实体摘要: {entity_summary}
 实体属性: {attrs_str}
+{project_brief_block}
 
 上下文信息:
 {context_str}
@@ -657,7 +683,7 @@ class OasisProfileGenerator:
 3. age: 年龄数字（必须是整数）
 4. gender: 性别，必须是英文: "male" 或 "female"
 5. mbti: MBTI类型（如INTJ、ENFP等）
-6. country: 国家（使用中文，如"中国"）
+6. country: 国家（使用中文，优先使用与项目一致的国家，如"{country_hint}"）
 7. profession: 职业
 8. interested_topics: 感兴趣话题数组
 
@@ -681,6 +707,8 @@ class OasisProfileGenerator:
         
         attrs_str = json.dumps(entity_attributes, ensure_ascii=False) if entity_attributes else "无"
         context_str = context[:3000] if context else "无额外上下文"
+        project_brief_block = self._get_project_brief_block()
+        country_hint = self._get_country_hint(for_prompt=True)
         
         return f"""为机构/群体实体生成详细的社交媒体账号设定,最大程度还原已有现实情况。
 
@@ -688,6 +716,7 @@ class OasisProfileGenerator:
 实体类型: {entity_type}
 实体摘要: {entity_summary}
 实体属性: {attrs_str}
+{project_brief_block}
 
 上下文信息:
 {context_str}
@@ -706,7 +735,7 @@ class OasisProfileGenerator:
 3. age: 固定填30（机构账号的虚拟年龄）
 4. gender: 固定填"other"（机构账号使用other表示非个人）
 5. mbti: MBTI类型，用于描述账号风格，如ISTJ代表严谨保守
-6. country: 国家（使用中文，如"中国"）
+6. country: 国家（使用中文，优先使用与项目一致的国家，如"{country_hint}"）
 7. profession: 机构职能描述
 8. interested_topics: 关注领域数组
 
@@ -728,6 +757,7 @@ class OasisProfileGenerator:
         
         # 根据实体类型生成不同的人设
         entity_type_lower = entity_type.lower()
+        country_hint = self._get_country_hint()
         
         if entity_type_lower in ["student", "alumni"]:
             return {
@@ -736,19 +766,19 @@ class OasisProfileGenerator:
                 "age": random.randint(18, 30),
                 "gender": random.choice(["male", "female"]),
                 "mbti": random.choice(self.MBTI_TYPES),
-                "country": random.choice(self.COUNTRIES),
+                "country": country_hint if country_hint != "项目所在地区" else random.choice(self.COUNTRIES),
                 "profession": "Student",
                 "interested_topics": ["Education", "Social Issues", "Technology"],
             }
         
-        elif entity_type_lower in ["publicfigure", "expert", "faculty"]:
+        elif entity_type_lower in ["publicfigure", "expert", "faculty", "candidate", "politician", "communityleader"]:
             return {
                 "bio": f"Expert and thought leader in their field.",
                 "persona": f"{entity_name} is a recognized {entity_type.lower()} who shares insights and opinions on important matters. They are known for their expertise and influence in public discourse.",
                 "age": random.randint(35, 60),
                 "gender": random.choice(["male", "female"]),
                 "mbti": random.choice(["ENTJ", "INTJ", "ENTP", "INTP"]),
-                "country": random.choice(self.COUNTRIES),
+                "country": country_hint if country_hint != "项目所在地区" else random.choice(self.COUNTRIES),
                 "profession": entity_attributes.get("occupation", "Expert"),
                 "interested_topics": ["Politics", "Economics", "Culture & Society"],
             }
@@ -760,19 +790,19 @@ class OasisProfileGenerator:
                 "age": 30,  # 机构虚拟年龄
                 "gender": "other",  # 机构使用other
                 "mbti": "ISTJ",  # 机构风格：严谨保守
-                "country": "中国",
+                "country": country_hint,
                 "profession": "Media",
                 "interested_topics": ["General News", "Current Events", "Public Affairs"],
             }
         
-        elif entity_type_lower in ["university", "governmentagency", "ngo", "organization"]:
+        elif entity_type_lower in ["university", "governmentagency", "ngo", "organization", "politicalparty", "campaign", "movement", "neighborhood"]:
             return {
                 "bio": f"Official account of {entity_name}.",
                 "persona": f"{entity_name} is an institutional entity that communicates official positions, announcements, and engages with stakeholders on relevant matters.",
                 "age": 30,  # 机构虚拟年龄
                 "gender": "other",  # 机构使用other
                 "mbti": "ISTJ",  # 机构风格：严谨保守
-                "country": "中国",
+                "country": country_hint,
                 "profession": entity_type,
                 "interested_topics": ["Public Policy", "Community", "Official Announcements"],
             }
@@ -785,7 +815,7 @@ class OasisProfileGenerator:
                 "age": random.randint(25, 50),
                 "gender": random.choice(["male", "female"]),
                 "mbti": random.choice(self.MBTI_TYPES),
-                "country": random.choice(self.COUNTRIES),
+                "country": country_hint if country_hint != "项目所在地区" else random.choice(self.COUNTRIES),
                 "profession": entity_type,
                 "interested_topics": ["General", "Social Issues"],
             }
@@ -1118,7 +1148,7 @@ class OasisProfileGenerator:
                 "age": profile.age if profile.age else 30,
                 "gender": self._normalize_gender(profile.gender),
                 "mbti": profile.mbti if profile.mbti else "ISTJ",
-                "country": profile.country if profile.country else "中国",
+                "country": profile.country if profile.country else self._get_country_hint(),
             }
             
             # 可选字段

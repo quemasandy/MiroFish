@@ -188,9 +188,14 @@ const initProject = async () => {
 
 const handleNewProject = async () => {
   const pending = getPendingUpload()
-  if (!pending.isPending || pending.files.length === 0) {
-    error.value = 'No pending files found.'
-    addLog('Error: No pending files found for new project.')
+  const hasPendingFiles = Array.isArray(pending.files) && pending.files.length > 0
+  const hasWebEvidence = Boolean(
+    pending.webEvidence?.urlsText?.trim() || pending.webEvidence?.notes?.trim()
+  )
+
+  if (!pending.isPending || (!hasPendingFiles && !hasWebEvidence)) {
+    error.value = 'No pending seed documents or web evidence found.'
+    addLog('Error: No pending seed documents or web evidence found for new project.')
     return
   }
   
@@ -203,6 +208,9 @@ const handleNewProject = async () => {
     const formData = new FormData()
     pending.files.forEach(f => formData.append('files', f))
     formData.append('simulation_requirement', pending.simulationRequirement)
+    formData.append('project_brief', JSON.stringify(pending.projectBrief || {}))
+    formData.append('web_sources', pending.webEvidence?.urlsText || '')
+    formData.append('evidence_notes', pending.webEvidence?.notes || '')
     
     const res = await generateOntology(formData)
     if (res.success) {

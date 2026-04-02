@@ -13,8 +13,10 @@ from ..config import Config
 from ..services.ontology_generator import OntologyGenerator
 from ..services.graph_builder import GraphBuilderService
 from ..services.text_processor import TextProcessor
+from ..services.web_evidence_ingestor import WebEvidenceIngestor, normalize_web_sources
 from ..utils.file_parser import FileParser
 from ..utils.logger import get_logger
+from ..utils.project_brief import build_project_brief_context, normalize_project_brief
 from ..models.task import TaskManager, TaskStatus
 from ..models.project import ProjectManager, ProjectStatus
 
@@ -153,6 +155,9 @@ def generate_ontology():
         simulation_requirement = request.form.get('simulation_requirement', '')
         project_name = request.form.get('project_name', 'Unnamed Project')
         additional_context = request.form.get('additional_context', '')
+        project_brief = normalize_project_brief(request.form.get('project_brief'))
+        web_sources = normalize_web_sources(request.form.get('web_sources'))
+        evidence_notes = request.form.get('evidence_notes', '').strip()
         
         logger.debug(f"项目名称: {project_name}")
         logger.debug(f"模拟需求: {simulation_requirement[:100]}...")
@@ -165,20 +170,24 @@ def generate_ontology():
         
         # 获取上传的文件
         uploaded_files = request.files.getlist('files')
-        if not uploaded_files or all(not f.filename for f in uploaded_files):
+        has_uploaded_files = bool(uploaded_files and any(f.filename for f in uploaded_files))
+        has_web_evidence = bool(web_sources or evidence_notes)
+        if not has_uploaded_files and not has_web_evidence:
             return jsonify({
                 "success": False,
-                "error": "请至少上传一个文档文件"
+                "error": "请至少上传一个文档文件，或提供实时网页证据"
             }), 400
         
         # 创建项目
         project = ProjectManager.create_project(name=project_name)
         project.simulation_requirement = simulation_requirement
+        project.project_brief = project_brief
         logger.info(f"创建项目: {project.project_id}")
         
         # 保存文件并提取文本
         document_texts = []
-        all_text = ""
+        clean_text_parts = []
+        evidence_warnings = []
         
         for file in uploaded_files:
             if file and file.filename and allowed_file(file.filename):
@@ -197,19 +206,56 @@ def generate_ontology():
                 text = FileParser.extract_text(file_info["path"])
                 text = TextProcessor.preprocess_text(text)
                 document_texts.append(text)
-                all_text += f"\n\n=== {file_info['original_filename']} ===\n{text}"
+                clean_text_parts.append(text)
+
+        if has_web_evidence:
+            logger.info("开始抓取网页证据: %s 条URL, notes=%s", len(web_sources), bool(evidence_notes))
+            evidence_result = WebEvidenceIngestor().ingest(
+                web_sources,
+                notes=evidence_notes,
+                project_brief=project_brief,
+                simulation_requirement=simulation_requirement,
+            )
+
+            evidence_markdown = TextProcessor.preprocess_text(evidence_result.get("markdown", ""))
+            evidence_warnings = evidence_result.get("warnings", [])
+
+            if evidence_markdown:
+                file_info = ProjectManager.save_generated_text_to_project(
+                    project.project_id,
+                    evidence_result.get("filename", "06_actualizacion_web.md"),
+                    evidence_markdown,
+                )
+                project.files.append({
+                    "filename": file_info["original_filename"],
+                    "size": file_info["size"],
+                    "generated": True,
+                    "source_count": len(evidence_result.get("sources", [])),
+                    "warning_count": len(evidence_warnings),
+                })
+                document_texts.append(evidence_markdown)
+                clean_text_parts.append(evidence_markdown)
         
         if not document_texts:
             ProjectManager.delete_project(project.project_id)
             return jsonify({
                 "success": False,
-                "error": "没有成功处理任何文档，请检查文件格式"
+                "error": "没有成功处理任何文档或网页证据，请检查输入内容"
             }), 400
         
         # 保存提取的文本
+        all_text = "\n\n".join(part for part in clean_text_parts if part)
         project.total_text_length = len(all_text)
         ProjectManager.save_extracted_text(project.project_id, all_text)
         logger.info(f"文本提取完成，共 {len(all_text)} 字符")
+
+        brief_context = build_project_brief_context(project_brief)
+        context_parts = []
+        if additional_context:
+            context_parts.append(additional_context)
+        if brief_context:
+            context_parts.append(brief_context)
+        merged_context = "\n\n".join(part for part in context_parts if part)
         
         # 生成本体
         logger.info("调用 LLM 生成本体定义...")
@@ -217,7 +263,7 @@ def generate_ontology():
         ontology = generator.generate(
             document_texts=document_texts,
             simulation_requirement=simulation_requirement,
-            additional_context=additional_context if additional_context else None
+            additional_context=merged_context if merged_context else None
         )
         
         # 保存本体到项目
@@ -242,7 +288,9 @@ def generate_ontology():
                 "ontology": project.ontology,
                 "analysis_summary": project.analysis_summary,
                 "files": project.files,
-                "total_text_length": project.total_text_length
+                "total_text_length": project.total_text_length,
+                "project_brief": project.project_brief,
+                "web_evidence_warnings": evidence_warnings,
             }
         })
         

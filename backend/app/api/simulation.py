@@ -462,6 +462,7 @@ def prepare_simulation():
         
         # 获取文档文本
         document_text = ProjectManager.get_extracted_text(state.project_id) or ""
+        project_brief = project.project_brief or {}
         
         entity_types_list = data.get('entity_types')
         use_llm_for_profiles = data.get('use_llm_for_profiles', True)
@@ -579,6 +580,7 @@ def prepare_simulation():
                     simulation_id=simulation_id,
                     simulation_requirement=simulation_requirement,
                     document_text=document_text,
+                    project_brief=project_brief,
                     defined_entity_types=entity_types_list,
                     use_llm_for_profiles=use_llm_for_profiles,
                     progress_callback=progress_callback,

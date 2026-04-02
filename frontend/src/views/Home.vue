@@ -125,7 +125,7 @@
             <div class="console-section">
               <div class="console-header">
                 <span class="console-label">01 / 现实种子</span>
-                <span class="console-meta">支持格式: PDF, MD, TXT</span>
+                <span class="console-meta">支持格式: PDF, MD, MARKDOWN, TXT</span>
               </div>
               
               <div 
@@ -140,7 +140,7 @@
                   ref="fileInput"
                   type="file"
                   multiple
-                  accept=".pdf,.md,.txt"
+                  accept=".pdf,.md,.markdown,.txt"
                   @change="handleFileSelect"
                   style="display: none"
                   :disabled="loading"
@@ -167,16 +167,121 @@
               <span>输入参数</span>
             </div>
 
+            <div class="console-section">
+              <div class="console-header">
+                <span class="console-label">>_ 02 / 项目简报</span>
+                <span class="console-meta">结构化上下文</span>
+              </div>
+
+              <div class="brief-grid">
+                <label class="brief-field">
+                  <span class="brief-label">分析场景</span>
+                  <select v-model="projectBrief.analysisDomain" class="brief-input" :disabled="loading">
+                    <option v-for="option in analysisDomainOptions" :key="option.value" :value="option.value">
+                      {{ option.label }}
+                    </option>
+                  </select>
+                </label>
+
+                <label class="brief-field">
+                  <span class="brief-label">地理范围</span>
+                  <input
+                    v-model="projectBrief.geography"
+                    class="brief-input"
+                    type="text"
+                    placeholder="例：Quito, Ecuador"
+                    :disabled="loading"
+                  />
+                </label>
+
+                <label class="brief-field">
+                  <span class="brief-label">时区</span>
+                  <input
+                    v-model="projectBrief.timezone"
+                    class="brief-input"
+                    type="text"
+                    placeholder="例：America/Guayaquil"
+                    :disabled="loading"
+                  />
+                </label>
+
+                <label class="brief-field">
+                  <span class="brief-label">预测时间范围</span>
+                  <input
+                    v-model="projectBrief.predictionHorizon"
+                    class="brief-input"
+                    type="text"
+                    placeholder="例：未来 3 周直到选举日"
+                    :disabled="loading"
+                  />
+                </label>
+
+                <label class="brief-field brief-field-full">
+                  <span class="brief-label">决策目标</span>
+                  <input
+                    v-model="projectBrief.decisionFocus"
+                    class="brief-input"
+                    type="text"
+                    placeholder="例：识别最可能获胜的候选人及其触发条件"
+                    :disabled="loading"
+                  />
+                </label>
+              </div>
+            </div>
+
+            <div class="console-divider">
+              <span>最新证据</span>
+            </div>
+
+            <div class="console-section">
+              <div class="console-header">
+                <span class="console-label">>_ 03 / 实时证据刷新</span>
+                <span class="console-meta">可选：URL 一行一个 + 手动补充说明</span>
+              </div>
+
+              <div class="brief-grid">
+                <label class="brief-field brief-field-full">
+                  <span class="brief-label">来源 URL</span>
+                  <textarea
+                    v-model="webEvidence.urlsText"
+                    class="brief-input brief-textarea"
+                    rows="5"
+                    placeholder="https://www.primicias.ec/...&#10;https://www.elcomercio.com/..."
+                    :disabled="loading"
+                  ></textarea>
+                </label>
+
+                <label class="brief-field brief-field-full">
+                  <span class="brief-label">手动备注</span>
+                  <textarea
+                    v-model="webEvidence.notes"
+                    class="brief-input brief-textarea"
+                    rows="4"
+                    placeholder="补充你刚看到但还没整理成文件的线索、事件、声明或警报。"
+                    :disabled="loading"
+                  ></textarea>
+                </label>
+              </div>
+
+              <div class="evidence-hint">
+                启动时会抓取这些来源并自动生成一个 <code>06_actualizacion_web.md</code> 种子文件。
+              </div>
+            </div>
+
+            <div class="console-divider">
+              <span>模拟提示</span>
+            </div>
+
             <!-- 输入区域 -->
             <div class="console-section">
               <div class="console-header">
-                <span class="console-label">>_ 02 / 模拟提示词</span>
+                <span class="console-label">>_ 04 / 模拟提示词</span>
               </div>
               <div class="input-wrapper">
                 <textarea
                   v-model="formData.simulationRequirement"
                   class="code-input"
-                  placeholder="// 用自然语言输入模拟或预测需求（例.武大若发布撤销肖某处分的公告，会引发什么舆情走向）"
+                  placeholder="// 用自然语言输入模拟或预测需求，明确结果、关键参与者与希望比较的场景"
                   rows="6"
                   :disabled="loading"
                 ></textarea>
@@ -210,12 +315,33 @@
 import { ref, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import HistoryDatabase from '../components/HistoryDatabase.vue'
+import { setPendingUpload } from '../store/pendingUpload'
 
 const router = useRouter()
+const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
+const analysisDomainOptions = [
+  { value: 'public_opinion_election', label: '选举 / 公共舆论预测' },
+  { value: 'public_opinion', label: '公共舆论 / 社会议题' },
+  { value: 'reputation_crisis', label: '声誉 / 危机传播' },
+  { value: 'policy_response', label: '政策反应 / 执行反馈' }
+]
 
 // 表单数据
 const formData = ref({
   simulationRequirement: ''
+})
+
+const webEvidence = ref({
+  urlsText: '',
+  notes: ''
+})
+
+const projectBrief = ref({
+  analysisDomain: 'public_opinion_election',
+  geography: '',
+  timezone: browserTimezone,
+  predictionHorizon: '',
+  decisionFocus: ''
 })
 
 // 文件列表
@@ -229,9 +355,13 @@ const isDragOver = ref(false)
 // 文件输入引用
 const fileInput = ref(null)
 
+const hasEvidenceInputs = computed(() => {
+  return webEvidence.value.urlsText.trim() !== '' || webEvidence.value.notes.trim() !== ''
+})
+
 // 计算属性:是否可以提交
 const canSubmit = computed(() => {
-  return formData.value.simulationRequirement.trim() !== '' && files.value.length > 0
+  return formData.value.simulationRequirement.trim() !== '' && (files.value.length > 0 || hasEvidenceInputs.value)
 })
 
 // 触发文件选择
@@ -270,7 +400,7 @@ const handleDrop = (e) => {
 const addFiles = (newFiles) => {
   const validFiles = newFiles.filter(file => {
     const ext = file.name.split('.').pop().toLowerCase()
-    return ['pdf', 'md', 'txt'].includes(ext)
+    return ['pdf', 'md', 'markdown', 'txt'].includes(ext)
   })
   files.value.push(...validFiles)
 }
@@ -293,14 +423,26 @@ const startSimulation = () => {
   if (!canSubmit.value || loading.value) return
   
   // 存储待上传的数据
-  import('../store/pendingUpload.js').then(({ setPendingUpload }) => {
-    setPendingUpload(files.value, formData.value.simulationRequirement)
-    
-    // 立即跳转到Process页面（使用特殊标识表示新建项目）
-    router.push({
-      name: 'Process',
-      params: { projectId: 'new' }
-    })
+  setPendingUpload(
+    files.value,
+    formData.value.simulationRequirement,
+    {
+      analysis_domain: projectBrief.value.analysisDomain,
+      geography: projectBrief.value.geography,
+      timezone: projectBrief.value.timezone || browserTimezone,
+      prediction_horizon: projectBrief.value.predictionHorizon,
+      decision_focus: projectBrief.value.decisionFocus
+    },
+    {
+      urlsText: webEvidence.value.urlsText,
+      notes: webEvidence.value.notes
+    }
+  )
+  
+  // 立即跳转到Process页面（使用特殊标识表示新建项目）
+  router.push({
+    name: 'Process',
+    params: { projectId: 'new' }
   })
 }
 </script>
@@ -794,6 +936,51 @@ const startSimulation = () => {
   background: #FAFAFA;
 }
 
+.brief-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.brief-field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.brief-field-full {
+  grid-column: 1 / -1;
+}
+
+.brief-label {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: #666;
+  letter-spacing: 0.04em;
+}
+
+.brief-input {
+  width: 100%;
+  border: 1px solid #DDD;
+  background: #FAFAFA;
+  padding: 12px 14px;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  color: var(--black);
+  outline: none;
+  transition: border-color 0.2s ease, background 0.2s ease;
+}
+
+.brief-input:focus {
+  border-color: var(--orange);
+  background: var(--white);
+}
+
+.brief-textarea {
+  min-height: 120px;
+  resize: vertical;
+}
+
 .code-input {
   width: 100%;
   border: none;
@@ -814,6 +1001,13 @@ const startSimulation = () => {
   font-family: var(--font-mono);
   font-size: 0.7rem;
   color: #AAA;
+}
+
+.evidence-hint {
+  margin-top: 12px;
+  font-size: 0.78rem;
+  color: #777;
+  line-height: 1.5;
 }
 
 .start-engine-btn {
@@ -885,6 +1079,10 @@ const startSimulation = () => {
   .hero-logo {
     max-width: 200px;
     margin-bottom: 20px;
+  }
+
+  .brief-grid {
+    grid-template-columns: 1fr;
   }
 }
 </style>

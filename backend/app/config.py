@@ -64,6 +64,13 @@ class Config:
     MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB
     UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), '../uploads')
     ALLOWED_EXTENSIONS = {'pdf', 'md', 'txt', 'markdown'}
+    WEB_EVIDENCE_MAX_SOURCES = int(os.environ.get('WEB_EVIDENCE_MAX_SOURCES', '8'))
+    WEB_EVIDENCE_FETCH_TIMEOUT = int(os.environ.get('WEB_EVIDENCE_FETCH_TIMEOUT', '20'))
+    WEB_EVIDENCE_MAX_SOURCE_CHARS = int(os.environ.get('WEB_EVIDENCE_MAX_SOURCE_CHARS', '3000'))
+    WEB_EVIDENCE_USER_AGENT = os.environ.get(
+        'WEB_EVIDENCE_USER_AGENT',
+        'MiroFishEvidenceBot/0.1 (+https://github.com/666ghj/MiroFish)'
+    )
     
     # 文本处理配置
     DEFAULT_CHUNK_SIZE = 500  # 默认切块大小

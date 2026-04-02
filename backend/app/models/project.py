@@ -46,6 +46,7 @@ class Project:
     
     # 配置
     simulation_requirement: Optional[str] = None
+    project_brief: Dict[str, Any] = field(default_factory=dict)
     chunk_size: int = 500
     chunk_overlap: int = 50
     
@@ -67,6 +68,7 @@ class Project:
             "graph_id": self.graph_id,
             "graph_build_task_id": self.graph_build_task_id,
             "simulation_requirement": self.simulation_requirement,
+            "project_brief": self.project_brief,
             "chunk_size": self.chunk_size,
             "chunk_overlap": self.chunk_overlap,
             "error": self.error
@@ -92,6 +94,7 @@ class Project:
             graph_id=data.get('graph_id'),
             graph_build_task_id=data.get('graph_build_task_id'),
             simulation_requirement=data.get('simulation_requirement'),
+            project_brief=data.get('project_brief', {}),
             chunk_size=data.get('chunk_size', 500),
             chunk_overlap=data.get('chunk_overlap', 50),
             error=data.get('error')
@@ -270,6 +273,38 @@ class ProjectManager:
             "path": file_path,
             "size": file_size
         }
+
+    @classmethod
+    def save_generated_text_to_project(cls, project_id: str, original_filename: str, text: str) -> Dict[str, str]:
+        """
+        保存服务端生成的文本文件到项目目录
+
+        Args:
+            project_id: 项目ID
+            original_filename: 原始文件名
+            text: 文件内容
+
+        Returns:
+            文件信息字典 {filename, path, size}
+        """
+        files_dir = cls._get_project_files_dir(project_id)
+        os.makedirs(files_dir, exist_ok=True)
+
+        ext = os.path.splitext(original_filename)[1].lower() or '.txt'
+        safe_filename = f"{uuid.uuid4().hex[:8]}{ext}"
+        file_path = os.path.join(files_dir, safe_filename)
+
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(text)
+
+        file_size = os.path.getsize(file_path)
+
+        return {
+            "original_filename": original_filename,
+            "saved_filename": safe_filename,
+            "path": file_path,
+            "size": file_size
+        }
     
     @classmethod
     def save_extracted_text(cls, project_id: str, text: str) -> None:
@@ -302,4 +337,3 @@ class ProjectManager:
             for f in os.listdir(files_dir) 
             if os.path.isfile(os.path.join(files_dir, f))
         ]
-

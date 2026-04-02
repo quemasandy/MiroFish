@@ -21,12 +21,17 @@ from openai import OpenAI
 from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.llm_routing import resolve_llm_config
+from ..utils.project_brief import (
+    build_project_brief_context,
+    infer_activity_locale_hint,
+    normalize_project_brief,
+)
 from .zep_entity_reader import EntityNode, ZepEntityReader
 
 logger = get_logger('mirofish.simulation_config')
 
-# 中国作息时间配置（北京时间）
-CHINA_TIMEZONE_CONFIG = {
+# 默认社交作息时间配置（按项目本地时间理解）
+DEFAULT_ACTIVITY_PATTERN = {
     # 深夜时段（几乎无人活动）
     "dead_hours": [0, 1, 2, 3, 4, 5],
     # 早间时段（逐渐醒来）
@@ -82,7 +87,7 @@ class AgentActivityConfig:
 
 @dataclass  
 class TimeSimulationConfig:
-    """时间模拟配置（基于中国人作息习惯）"""
+    """时间模拟配置（基于项目本地作息）"""
     # 模拟总时长（模拟小时数）
     total_simulation_hours: int = 72  # 默认模拟72小时（3天）
     
@@ -93,7 +98,7 @@ class TimeSimulationConfig:
     agents_per_hour_min: int = 5
     agents_per_hour_max: int = 20
     
-    # 高峰时段（晚间19-22点，中国人最活跃的时间）
+    # 高峰时段（按项目本地时间）
     peak_hours: List[int] = field(default_factory=lambda: [19, 20, 21, 22])
     peak_activity_multiplier: float = 1.5
     
@@ -226,12 +231,16 @@ class SimulationConfigGenerator:
         self,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
-        model_name: Optional[str] = None
+        model_name: Optional[str] = None,
+        project_brief: Optional[Dict[str, Any]] = None,
     ):
         self._api_key_override = api_key
         self._base_url_override = base_url
         self._model_name_override = model_name
         self._stage_clients: Dict[str, Any] = {}
+        self.project_brief = normalize_project_brief(project_brief)
+        self.project_brief_context = build_project_brief_context(self.project_brief)
+        self.locale_hint = infer_activity_locale_hint(self.project_brief)
 
         runtime_config = self._get_stage_config("simulation_runtime")
         self.api_key = runtime_config.api_key
@@ -240,6 +249,10 @@ class SimulationConfigGenerator:
         
         if not self.api_key:
             raise ValueError("LLM_API_KEY 未配置")
+
+    def _get_locale_hint(self) -> str:
+        """Return the project-local locale hint for activity prompts."""
+        return self.locale_hint or "项目本地语境"
     
     def generate_config(
         self,
@@ -391,10 +404,10 @@ class SimulationConfigGenerator:
         entity_summary = self._summarize_entities(entities)
         
         # 构建上下文
-        context_parts = [
-            f"## 模拟需求\n{simulation_requirement}",
-            f"\n## 实体信息 ({len(entities)}个)\n{entity_summary}",
-        ]
+        context_parts = [f"## 模拟需求\n{simulation_requirement}"]
+        if self.project_brief_context:
+            context_parts.append(f"\n{self.project_brief_context}")
+        context_parts.append(f"\n## 实体信息 ({len(entities)}个)\n{entity_summary}")
         
         current_length = sum(len(p) for p in context_parts)
         remaining_length = self.MAX_CONTEXT_LENGTH - current_length - 500  # 留500字符余量
@@ -574,6 +587,7 @@ class SimulationConfigGenerator:
         """生成时间配置"""
         # 使用配置的上下文截断长度
         context_truncated = context[:self.TIME_CONFIG_CONTEXT_LENGTH]
+        locale_hint = self._get_locale_hint()
         
         # 计算最大允许值（80%的agent数）
         max_agents_allowed = max(1, int(num_entities * 0.9))
@@ -586,7 +600,7 @@ class SimulationConfigGenerator:
 请生成时间配置JSON。
 
 ### 基本原则（仅供参考，需根据具体事件和参与群体灵活调整）：
-- 用户群体为中国人，需符合北京时间作息习惯
+- 时间分布要符合 {locale_hint} 的本地作息，而不是默认北京或中国语境
 - 凌晨0-5点几乎无人活动（活跃度系数0.05）
 - 早上6-8点逐渐活跃（活跃度系数0.4）
 - 工作时间9-18点中等活跃（活跃度系数0.7）
@@ -623,7 +637,7 @@ class SimulationConfigGenerator:
 - work_hours (int数组): 工作时段
 - reasoning (string): 简要说明为什么这样配置"""
 
-        system_prompt = "你是社交媒体模拟专家。返回纯JSON格式，时间配置需符合中国人作息习惯。"
+        system_prompt = f"你是社交媒体模拟专家。返回纯JSON格式，时间配置需符合 {locale_hint} 的本地作息。"
         
         try:
             return self._call_llm_with_retry(prompt, system_prompt, "sim_config_time_event")
@@ -632,17 +646,18 @@ class SimulationConfigGenerator:
             return self._get_default_time_config(num_entities)
     
     def _get_default_time_config(self, num_entities: int) -> Dict[str, Any]:
-        """获取默认时间配置（中国人作息）"""
+        """获取默认时间配置（项目本地作息）"""
+        locale_hint = self._get_locale_hint()
         return {
             "total_simulation_hours": 72,
             "minutes_per_round": 60,  # 每轮1小时，加快时间流速
             "agents_per_hour_min": max(1, num_entities // 15),
             "agents_per_hour_max": max(5, num_entities // 5),
-            "peak_hours": [19, 20, 21, 22],
-            "off_peak_hours": [0, 1, 2, 3, 4, 5],
-            "morning_hours": [6, 7, 8],
-            "work_hours": [9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
-            "reasoning": "使用默认中国人作息配置（每轮1小时）"
+            "peak_hours": DEFAULT_ACTIVITY_PATTERN["peak_hours"],
+            "off_peak_hours": DEFAULT_ACTIVITY_PATTERN["dead_hours"],
+            "morning_hours": DEFAULT_ACTIVITY_PATTERN["morning_hours"],
+            "work_hours": DEFAULT_ACTIVITY_PATTERN["work_hours"],
+            "reasoning": f"使用默认本地作息配置（{locale_hint}，每轮1小时）"
         }
     
     def _parse_time_config(self, result: Dict[str, Any], num_entities: int) -> TimeSimulationConfig:
@@ -670,12 +685,12 @@ class SimulationConfigGenerator:
             minutes_per_round=result.get("minutes_per_round", 60),  # 默认每轮1小时
             agents_per_hour_min=agents_per_hour_min,
             agents_per_hour_max=agents_per_hour_max,
-            peak_hours=result.get("peak_hours", [19, 20, 21, 22]),
-            off_peak_hours=result.get("off_peak_hours", [0, 1, 2, 3, 4, 5]),
+            peak_hours=result.get("peak_hours", DEFAULT_ACTIVITY_PATTERN["peak_hours"]),
+            off_peak_hours=result.get("off_peak_hours", DEFAULT_ACTIVITY_PATTERN["dead_hours"]),
             off_peak_activity_multiplier=0.05,  # 凌晨几乎无人
-            morning_hours=result.get("morning_hours", [6, 7, 8]),
+            morning_hours=result.get("morning_hours", DEFAULT_ACTIVITY_PATTERN["morning_hours"]),
             morning_activity_multiplier=0.4,
-            work_hours=result.get("work_hours", list(range(9, 19))),
+            work_hours=result.get("work_hours", DEFAULT_ACTIVITY_PATTERN["work_hours"]),
             work_activity_multiplier=0.7,
             peak_activity_multiplier=1.5
         )
@@ -854,6 +869,7 @@ class SimulationConfigGenerator:
         simulation_requirement: str
     ) -> List[AgentActivityConfig]:
         """分批生成Agent配置"""
+        locale_hint = self._get_locale_hint()
         
         # 构建实体信息（使用配置的摘要长度）
         entity_list = []
@@ -877,7 +893,7 @@ class SimulationConfigGenerator:
 
 ## 任务
 为每个实体生成活动配置，注意：
-- **时间符合中国人作息**：凌晨0-5点几乎不活动，晚间19-22点最活跃
+- **时间符合 {locale_hint} 的本地作息**：默认凌晨0-5点几乎不活动，晚间19-22点最活跃；如果事件性质特殊可调整
 - **官方机构**（University/GovernmentAgency）：活跃度低(0.1-0.3)，工作时间(9-17)活动，响应慢(60-240分钟)，影响力高(2.5-3.0)
 - **媒体**（MediaOutlet）：活跃度中(0.4-0.6)，全天活动(8-23)，响应快(5-30分钟)，影响力高(2.0-2.5)
 - **个人**（Student/Person/Alumni）：活跃度高(0.6-0.9)，主要晚间活动(18-23)，响应快(1-15分钟)，影响力低(0.8-1.2)
@@ -885,24 +901,24 @@ class SimulationConfigGenerator:
 
 返回JSON格式（不要markdown）：
 {{
-    "agent_configs": [
-        {{
-            "agent_id": <必须与输入一致>,
-            "activity_level": <0.0-1.0>,
-            "posts_per_hour": <发帖频率>,
-            "comments_per_hour": <评论频率>,
-            "active_hours": [<活跃小时列表，考虑中国人作息>],
-            "response_delay_min": <最小响应延迟分钟>,
-            "response_delay_max": <最大响应延迟分钟>,
-            "sentiment_bias": <-1.0到1.0>,
-            "stance": "<supportive/opposing/neutral/observer>",
-            "influence_weight": <影响力权重>
+            "agent_configs": [
+                {{
+                    "agent_id": <必须与输入一致>,
+                    "activity_level": <0.0-1.0>,
+                    "posts_per_hour": <发帖频率>,
+                    "comments_per_hour": <评论频率>,
+                    "active_hours": [<活跃小时列表，考虑项目本地作息>],
+                    "response_delay_min": <最小响应延迟分钟>,
+                    "response_delay_max": <最大响应延迟分钟>,
+                    "sentiment_bias": <-1.0到1.0>,
+                    "stance": "<supportive/opposing/neutral/observer>",
+                    "influence_weight": <影响力权重>
         }},
         ...
     ]
 }}"""
 
-        system_prompt = "你是社交媒体行为分析专家。返回纯JSON，配置需符合中国人作息习惯。"
+        system_prompt = f"你是社交媒体行为分析专家。返回纯JSON，配置需符合 {locale_hint} 的本地作息。"
         
         try:
             result = self._call_llm_with_retry(prompt, system_prompt, "sim_config_agent_batch")
@@ -941,10 +957,10 @@ class SimulationConfigGenerator:
         return configs
     
     def _generate_agent_config_by_rule(self, entity: EntityNode) -> Dict[str, Any]:
-        """基于规则生成单个Agent配置（中国人作息）"""
+        """基于规则生成单个Agent配置（项目本地作息）"""
         entity_type = (entity.get_entity_type() or "Unknown").lower()
         
-        if entity_type in ["university", "governmentagency", "ngo"]:
+        if entity_type in ["university", "governmentagency", "ngo", "organization", "politicalparty", "campaign", "movement"]:
             # 官方机构：工作时间活动，低频率，高影响力
             return {
                 "activity_level": 0.2,
@@ -957,7 +973,7 @@ class SimulationConfigGenerator:
                 "stance": "neutral",
                 "influence_weight": 3.0
             }
-        elif entity_type in ["mediaoutlet"]:
+        elif entity_type in ["mediaoutlet", "socialmediaplatform"]:
             # 媒体：全天活动，中等频率，高影响力
             return {
                 "activity_level": 0.5,
@@ -970,7 +986,7 @@ class SimulationConfigGenerator:
                 "stance": "observer",
                 "influence_weight": 2.5
             }
-        elif entity_type in ["professor", "expert", "official"]:
+        elif entity_type in ["professor", "expert", "official", "candidate", "politician", "journalist"]:
             # 专家/教授：工作+晚间活动，中等频率
             return {
                 "activity_level": 0.4,
